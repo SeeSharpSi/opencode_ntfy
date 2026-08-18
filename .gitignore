@@ -1,0 +1,14 @@
+# Local notes and OpenCode configuration may contain credentials.
+alpine_server_notes.md
+opencode.json
+opencode.jsonc
+.opencode/
+
+# Environment files and private key material.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
