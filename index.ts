@@ -10,6 +10,8 @@ type PermissionRequest = {
   sessionID: string
 }
 
+const permissionNotificationDelay = 100
+
 type Session = {
   title: string
   parentID?: string
@@ -201,6 +203,9 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
     permissionRequests.set(request.id, request.sessionID)
 
     try {
+      // Let OpenCode's auto-approve responder clear transient requests first.
+      await new Promise<void>((resolve) => setTimeout(resolve, permissionNotificationDelay))
+      if (disposed || permissionRequests.get(request.id) !== request.sessionID) return
       const session = await getSession(request.sessionID)
       if (disposed || permissionRequests.get(request.id) !== request.sessionID) return
       await publishNotification(permissionSequenceID(request.id), {

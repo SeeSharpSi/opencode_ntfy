@@ -219,9 +219,58 @@ test("permission requests publish and clear a notification", { timeout: 1000 }, 
   }
 })
 
+test("auto-approved permission requests never publish a notification", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const published = []
+  const cleared = []
+
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) {
+      cleared.push(String(url))
+      return new Response(null, { status: 200 })
+    }
+    if (options.method === "POST") {
+      published.push(JSON.parse(options.body))
+      return new Response(null, { status: 200 })
+    }
+    throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
+  }
+
+  const hooks = await NtfyPlugin(input, {
+    topic: "test-topic",
+    server: "https://ntfy.example.com",
+  })
+
+  try {
+    const asked = hooks.event({
+      event: {
+        type: "permission.asked",
+        properties: { id: "permission-id", sessionID: "session-id" },
+      },
+    })
+    await hooks.event({
+      event: {
+        type: "permission.replied",
+        properties: { sessionID: "session-id", requestID: "permission-id", reply: "once" },
+      },
+    })
+    await asked
+
+    assert.deepEqual(published, [])
+    assert.deepEqual(cleared, [])
+  } finally {
+    await hooks.dispose()
+    globalThis.fetch = originalFetch
+  }
+})
+
 test("chat content is hidden by default while notification types are preserved", { timeout: 1000 }, async () => {
   const originalFetch = globalThis.fetch
   const published = []
+  let resolvePermissionPublished
+  const permissionPublished = new Promise((resolve) => {
+    resolvePermissionPublished = resolve
+  })
   const privateInput = {
     client: {
       session: {
@@ -236,6 +285,7 @@ test("chat content is hidden by default while notification types are preserved",
     if (options.method === "POST") {
       const body = JSON.parse(options.body)
       published.push(body)
+      if (body.tags?.includes("warning")) resolvePermissionPublished()
       return new Response(null, { status: 200 })
     }
     throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
@@ -253,6 +303,7 @@ test("chat content is hidden by default while notification types are preserved",
         properties: { id: "permission-id", sessionID: "session-id" },
       },
     })
+    await permissionPublished
     await hooks.event({
       event: {
         type: "permission.replied",
