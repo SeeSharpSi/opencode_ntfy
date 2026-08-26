@@ -156,7 +156,7 @@ test("dispose waits for an in-flight completion publish before clearing it", { t
   }
 })
 
-test("permission requests publish and clear a notification", { timeout: 1000 }, async () => {
+test("permission requests publish, suppress completion, and clear a notification", { timeout: 1000 }, async () => {
   const originalFetch = globalThis.fetch
   const published = []
   const cleared = []
@@ -198,6 +198,11 @@ test("permission requests publish and clear a notification", { timeout: 1000 }, 
     assert.equal(published[0].priority, 4)
     assert.deepEqual(published[0].tags, ["warning"])
     assert.equal(published[0].sequence_id, "opencode-permission-permission-id")
+
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-id" } },
+    })
+    assert.equal(published.some((body) => body.tags?.includes("heavy_check_mark")), false)
 
     await hooks.event({
       event: {
@@ -258,6 +263,59 @@ test("auto-approved permission requests never publish a notification", { timeout
 
     assert.deepEqual(published, [])
     assert.deepEqual(cleared, [])
+  } finally {
+    await hooks.dispose()
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("completion waits for an auto-approved permission request", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const published = []
+  const cleared = []
+
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) {
+      cleared.push(String(url))
+      return new Response(null, { status: 200 })
+    }
+    if (options.method === "POST") {
+      published.push(JSON.parse(options.body))
+      return new Response(null, { status: 200 })
+    }
+    throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
+  }
+
+  const hooks = await NtfyPlugin(input, {
+    topic: "test-topic",
+    server: "https://ntfy.example.com",
+    hideChatContent: false,
+  })
+
+  try {
+    const asked = hooks.event({
+      event: {
+        type: "permission.asked",
+        properties: { id: "permission-id", sessionID: "session-id" },
+      },
+    })
+    const idle = hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-id" } },
+    })
+    await hooks.event({
+      event: {
+        type: "permission.replied",
+        properties: { sessionID: "session-id", requestID: "permission-id", reply: "once" },
+      },
+    })
+    await Promise.all([asked, idle])
+
+    const completion = published.find((body) => body.tags?.includes("heavy_check_mark"))
+    const warning = published.find((body) => body.tags?.includes("warning"))
+    assert.equal(completion.title, "Test session")
+    assert.equal(completion.message, "OpenCode response finished.")
+    assert.equal(completion.sequence_id, "opencode-session-id")
+    assert.equal(warning, undefined)
   } finally {
     await hooks.dispose()
     globalThis.fetch = originalFetch

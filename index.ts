@@ -235,14 +235,18 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
   }
 
   const notifyFinished = async (sessionID: string) => {
-    if (
-      [...requests.values()].includes(sessionID) ||
-      [...permissionRequests.values()].includes(sessionID)
-    ) {
-      return
+    const generation = completionGenerations.get(sessionID) ?? 0
+    if ([...requests.values()].includes(sessionID)) return
+    if ([...permissionRequests.values()].includes(sessionID)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, permissionNotificationDelay))
+      if (
+        [...requests.values()].includes(sessionID) ||
+        [...permissionRequests.values()].includes(sessionID)
+      ) {
+        return
+      }
     }
     // Event hooks overlap; reject idle work invalidated by a newer prompt or session close.
-    const generation = completionGenerations.get(sessionID) ?? 0
     try {
       const session = await getSession(sessionID)
       if (
