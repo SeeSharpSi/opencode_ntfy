@@ -91,7 +91,7 @@ test("plugin options override environment for question notifications", { timeout
     const notification = await payload
     assert.equal(notification.topic, "test-topic")
     assert.equal(notification.title, "Test session")
-    assert.equal(notification.message, "OpenCode has a question.")
+    assert.equal(notification.message, "Question posed")
     assert.equal("actions" in notification, false)
     assert.equal("click" in notification, false)
     assert.equal(notification.sequence_id, "opencode-question-request-id")
@@ -194,9 +194,8 @@ test("permission requests publish, suppress completion, and clear a notification
 
     assert.equal(published.length, 1)
     assert.equal(published[0].title, "Test session")
-    assert.equal(published[0].message, "OpenCode needs permission.")
+    assert.equal(published[0].message, "Permissions request")
     assert.equal(published[0].priority, 4)
-    assert.deepEqual(published[0].tags, ["warning"])
     assert.equal(published[0].sequence_id, "opencode-permission-permission-id")
 
     await hooks.event({
@@ -310,10 +309,12 @@ test("completion waits for an auto-approved permission request", { timeout: 1000
     })
     await Promise.all([asked, idle])
 
-    const completion = published.find((body) => body.tags?.includes("heavy_check_mark"))
-    const warning = published.find((body) => body.tags?.includes("warning"))
+    const completion = published.find((body) => body.sequence_id === "opencode-session-id")
+    const warning = published.find(
+      (body) => body.sequence_id === "opencode-permission-permission-id",
+    )
     assert.equal(completion.title, "Test session")
-    assert.equal(completion.message, "OpenCode response finished.")
+    assert.equal(completion.message, "Response finished")
     assert.equal(completion.sequence_id, "opencode-session-id")
     assert.equal(warning, undefined)
   } finally {
@@ -343,7 +344,7 @@ test("chat content is hidden by default while notification types are preserved",
     if (options.method === "POST") {
       const body = JSON.parse(options.body)
       published.push(body)
-      if (body.tags?.includes("warning")) resolvePermissionPublished()
+      if (body.sequence_id === "opencode-permission-permission-id") resolvePermissionPublished()
       return new Response(null, { status: 200 })
     }
     throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
@@ -388,15 +389,17 @@ test("chat content is hidden by default while notification types are preserved",
       },
     })
 
-    const question = published.find((body) => body.tags?.includes("question"))
-    const permission = published.find((body) => body.tags?.includes("warning"))
-    const completion = published.find((body) => body.tags?.includes("heavy_check_mark"))
+    const question = published.find((body) => body.sequence_id === "opencode-question-question-id")
+    const permission = published.find(
+      (body) => body.sequence_id === "opencode-permission-permission-id",
+    )
+    const completion = published.find((body) => body.sequence_id === "opencode-session-id")
     assert.equal(permission.title, "OpenCode")
-    assert.equal(permission.message, "OpenCode needs permission.")
+    assert.equal(permission.message, "Permissions request")
     assert.equal(completion.title, "OpenCode")
-    assert.equal(completion.message, "OpenCode response finished.")
+    assert.equal(completion.message, "Response finished")
     assert.equal(question.title, "OpenCode")
-    assert.equal(question.message, "OpenCode has a question.")
+    assert.equal(question.message, "Question posed")
     assert.equal("actions" in question, false)
 
     const outbound = JSON.stringify(published)
@@ -544,5 +547,158 @@ test("rejected question cannot publish after its session lookup resolves", { tim
   } finally {
     await hooks.dispose()
     globalThis.fetch = originalFetch
+  }
+})
+
+test("failed completion publish logs actionable ntfy JSON errors", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const originalConsoleError = console.error
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+    assert.equal(options.method, "POST")
+    return new Response(
+      JSON.stringify({ code: 40301, http: 403, error: "forbidden", link: "https://ntfy.sh/docs" }),
+      { status: 403, headers: { "Content-Type": "application/json" } },
+    )
+  }
+  console.error = (...args) => calls.push(args)
+
+  let hooks
+  try {
+    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-id" } },
+    })
+
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].length, 1)
+    assert.equal(typeof calls[0][0], "string")
+    assert.equal(
+      calls[0][0],
+      "[opencode-ntfy] ntfy publish failed: HTTP 403, ntfy code 40301: forbidden " +
+        "Hint: set NTFY_TOKEN or username/password; check topic permissions.",
+    )
+  } finally {
+    try {
+      if (hooks) await hooks.dispose()
+    } finally {
+      globalThis.fetch = originalFetch
+      console.error = originalConsoleError
+    }
+  }
+})
+
+test("identical failed completion publishes are suppressed until recovery", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const originalConsoleError = console.error
+  const calls = []
+  const responses = [403, 403, 200, 403]
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+    assert.equal(options.method, "POST")
+    const status = responses.shift()
+    assert.notEqual(status, undefined)
+    if (status === 200) return new Response(null, { status })
+    return new Response(
+      JSON.stringify({ code: 40301, http: 403, error: "forbidden", link: "https://ntfy.sh/docs" }),
+      { status, headers: { "Content-Type": "application/json" } },
+    )
+  }
+  console.error = (...args) => calls.push(args)
+
+  let hooks
+  try {
+    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    const idle = () =>
+      hooks.event({
+        event: { type: "session.idle", properties: { sessionID: "session-id" } },
+      })
+
+    await idle()
+    await idle()
+    assert.equal(calls.length, 1)
+    await idle()
+    assert.equal(calls.length, 2)
+    assert.match(calls[1][0], /recovered \(1 identical failure\(s\) suppressed\)/)
+    await idle()
+    assert.equal(calls.length, 3)
+    assert.match(calls[2][0], /ntfy publish failed/)
+    assert.equal(responses.length, 0)
+  } finally {
+    try {
+      if (hooks) await hooks.dispose()
+    } finally {
+      globalThis.fetch = originalFetch
+      console.error = originalConsoleError
+    }
+  }
+})
+
+test("non-JSON completion publish errors are bounded and one-line", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const originalConsoleError = console.error
+  const calls = []
+  const longBody = "server failure details ".repeat(20)
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+    assert.equal(options.method, "POST")
+    return new Response(longBody, { status: 500 })
+  }
+  console.error = (...args) => calls.push(args)
+
+  let hooks
+  try {
+    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-id" } },
+    })
+
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].length, 1)
+    const boundedBody = longBody.replace(/\s+/g, " ").trim().slice(0, 120)
+    assert.equal(calls[0][0], `[opencode-ntfy] ntfy publish failed: HTTP 500: ${boundedBody}`)
+  } finally {
+    try {
+      if (hooks) await hooks.dispose()
+    } finally {
+      globalThis.fetch = originalFetch
+      console.error = originalConsoleError
+    }
+  }
+})
+
+test("network completion publish errors log unreachable hint without stack", { timeout: 1000 }, async () => {
+  const originalFetch = globalThis.fetch
+  const originalConsoleError = console.error
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+    assert.equal(options.method, "POST")
+    throw new TypeError("fetch failed")
+  }
+  console.error = (...args) => calls.push(args)
+
+  let hooks
+  try {
+    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-id" } },
+    })
+
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].length, 1)
+    assert.equal(
+      calls[0][0],
+      "[opencode-ntfy] ntfy completion notification failed: fetch failed " +
+        "Hint: ntfy server unreachable; check network and server URL.",
+    )
+  } finally {
+    try {
+      if (hooks) await hooks.dispose()
+    } finally {
+      globalThis.fetch = originalFetch
+      console.error = originalConsoleError
+    }
   }
 })

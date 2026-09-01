@@ -77,10 +77,74 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
   const notificationOperations = new Map<string, Promise<boolean>>()
   const completionGenerations = new Map<string, number>()
   let disposed = false
+  let lastFailure: string | undefined
+  let suppressedFailures = 0
+  const failureMessageLimit = 320
+
+  const oneLine = (value: unknown, limit = 120) =>
+    String(value).replace(/\s+/g, " ").trim().slice(0, limit)
+
+  const failureHint = (status?: number) => {
+    if (status === 401 || status === 403) {
+      return "Hint: set NTFY_TOKEN or username/password; check topic permissions."
+    }
+    if (status === 429) return "Hint: ntfy rate limit reached; retry later."
+    if (status === undefined) return "Hint: ntfy server unreachable; check network and server URL."
+    return ""
+  }
+
+  const logFailure = (message: string) => {
+    const normalized = oneLine(message, failureMessageLimit)
+    if (normalized === lastFailure) {
+      suppressedFailures++
+      return
+    }
+    const suffix = suppressedFailures > 0 ? ` (${suppressedFailures} identical failure(s) suppressed)` : ""
+    console.error(`[opencode-ntfy] ${normalized}${suffix}`)
+    lastFailure = normalized
+    suppressedFailures = 0
+  }
+
+  const recordSuccess = (action: string) => {
+    if (suppressedFailures > 0) {
+      console.error(
+        `[opencode-ntfy] ${action} recovered (${suppressedFailures} identical failure(s) suppressed)`,
+      )
+    }
+    lastFailure = undefined
+    suppressedFailures = 0
+  }
+
+  const formatError = (action: string, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    if (error instanceof Error && message.startsWith("ntfy ")) {
+      return oneLine(message, failureMessageLimit)
+    }
+    const networkFailure =
+      error instanceof TypeError || (error instanceof Error && /fetch failed|network/i.test(message))
+    return `${action} failed: ${oneLine(message)}${networkFailure ? ` ${failureHint()}` : ""}`
+  }
 
   const check = async (response: Response, action: string) => {
-    if (!response.ok) throw new Error(`${action} failed: ${response.status} ${await response.text()}`)
-    return response
+    if (response.ok) {
+      recordSuccess(action)
+      return response
+    }
+    const body = await response.text()
+    let errorText = oneLine(body)
+    let code: number | undefined
+    try {
+      const parsed = JSON.parse(body) as { code?: unknown; error?: unknown }
+      if (typeof parsed.error === "string") errorText = oneLine(parsed.error)
+      if (typeof parsed.code === "number") code = parsed.code
+    } catch {
+      // Use bounded response text for non-JSON ntfy errors.
+    }
+    const codeText = code === undefined ? "" : `, ntfy code ${code}`
+    const hint = failureHint(response.status)
+    throw new Error(
+      `${action} failed: HTTP ${response.status}${codeText}: ${errorText || "request failed"}${hint ? ` ${hint}` : ""}`,
+    )
   }
 
   const topicUrl = (name: string, suffix = "") =>
@@ -137,7 +201,9 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
         )
         return false
       } catch (error) {
-        console.error("[opencode-ntfy] notification dismissal failed", error)
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          logFailure(formatError("ntfy notification dismissal", error))
+        }
         return active || forceUnknownNotification
       }
     })
@@ -174,13 +240,12 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
       if (disposed || requests.get(request.id) !== request.sessionID) return
       await publishNotification(questionSequenceID(request.id), {
         title: hideChatContent ? "OpenCode" : session.title,
-        message: "OpenCode has a question.",
+        message: "Question posed",
         priority: 4,
-        tags: ["question"],
       })
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        console.error("[opencode-ntfy] question notification failed", error)
+        logFailure(formatError("ntfy question notification", error))
       }
     }
   }
@@ -210,13 +275,12 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
       if (disposed || permissionRequests.get(request.id) !== request.sessionID) return
       await publishNotification(permissionSequenceID(request.id), {
         title: hideChatContent ? "OpenCode" : session.title,
-        message: "OpenCode needs permission.",
+        message: "Permissions request",
         priority: 4,
-        tags: ["warning"],
       })
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        console.error("[opencode-ntfy] permission notification failed", error)
+        logFailure(formatError("ntfy permission notification", error))
       }
     }
   }
@@ -258,12 +322,11 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
       }
       await publishNotification(completionSequenceID(sessionID), {
         title: hideChatContent ? "OpenCode" : session.title,
-        message: "OpenCode response finished.",
-        tags: ["heavy_check_mark"],
+        message: "Response finished",
       })
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        console.error("[opencode-ntfy] completion notification failed", error)
+        logFailure(formatError("ntfy completion notification", error))
       }
     }
   }
