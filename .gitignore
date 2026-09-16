@@ -5,6 +5,7 @@ opencode.jsonc
 .opencode/
 
 # Environment files and private key material.
+node_modules/
 .env
 .env.*
 !.env.example

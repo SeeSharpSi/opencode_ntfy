@@ -38,24 +38,26 @@ answer options.
 
 Use an unguessable topic name. A topic on a public ntfy server is effectively a password.
 
-If you later choose to enable the plugin, reference this file from OpenCode's `plugin` array. For example:
+If you later choose to enable the plugin, reference this file from OpenCode's native V2 `plugins` array. For example:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "/absolute/path/to/opencode-ntfy/index.ts",
-      {
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-ntfy",
+      "options": {
         "topic": "replace-with-random-topic",
         "server": "https://ntfy.example.com"
       }
-    ]
+    }
   ]
 }
 ```
 
-No package installation is required by this plugin. Quit and restart OpenCode after changing its configuration.
+Run `npm install` in the plugin directory before loading it. This installs the
+V2 plugin API and the development tools used by the test suite. Quit and restart
+OpenCode after changing its configuration.
 
 Pass secrets through the environment inherited by the OpenCode process and omit
 them from plugin options:

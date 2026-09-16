@@ -1,4 +1,5 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
+import type { OpenCodeEvent } from "@opencode/client"
 
 type QuestionRequest = {
   id: string
@@ -17,7 +18,15 @@ type Session = {
   parentID?: string
 }
 
-export const NtfyPlugin = (async ({ client, directory }, options) => {
+type NtfyContext = {
+  readonly options: Readonly<Record<string, unknown>>
+  readonly session: {
+    get(input: { sessionID: string }): Promise<unknown>
+  }
+}
+
+export async function createNtfyRuntime(ctx: NtfyContext) {
+  const options = ctx.options
   const environment = (
     globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } }
   ).process?.env
@@ -76,6 +85,7 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
   const permissionRequests = new Map<string, string>()
   const notificationOperations = new Map<string, Promise<boolean>>()
   const completionGenerations = new Map<string, number>()
+  const rootSessions = new Set<string>()
   let disposed = false
   let lastFailure: string | undefined
   let suppressedFailures = 0
@@ -223,12 +233,7 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
   }
 
   const getSession = async (sessionID: string) => {
-    const response = await client.session.get({
-      path: { id: sessionID },
-      query: { directory },
-      throwOnError: true,
-    })
-    return response.data as Session
+    return (await ctx.session.get({ sessionID })) as Session
   }
 
   const notifyQuestion = async (request: QuestionRequest) => {
@@ -320,6 +325,7 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
       ) {
         return
       }
+      rootSessions.add(sessionID)
       await publishNotification(completionSequenceID(sessionID), {
         title: hideChatContent ? "OpenCode" : session.title,
         message: "Response finished",
@@ -331,62 +337,38 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
     }
   }
 
-  return {
-    event: async ({ event }) => {
-      // Question and permission events are absent from the legacy plugin SDK union.
-      const input = event as
-        | typeof event
-        | { type: "question.asked"; properties: QuestionRequest }
-        | {
-            type: "question.replied" | "question.rejected"
-            properties: { requestID: string }
-          }
-        | { type: "permission.asked"; properties: PermissionRequest }
-        | {
-            type: "permission.replied"
-            properties: { sessionID: string; requestID: string }
-          }
-      if (input.type === "session.idle") {
-        await notifyFinished(input.properties.sessionID)
+  const handleEvent = async (event: OpenCodeEvent) => {
+    if (event.type === "session.idle") {
+      await notifyFinished(event.data.sessionID)
+    }
+    if (event.type === "session.deleted") {
+      invalidateCompletion(event.data.sessionID)
+      await dismissSessionQuestions(event.data.sessionID)
+      await dismissSessionPermissions(event.data.sessionID)
+      if (rootSessions.delete(event.data.sessionID)) {
+        await dismissCompletion(event.data.sessionID, true)
       }
-      if (input.type === "session.deleted") {
-        invalidateCompletion(input.properties.info.id)
-        await dismissSessionQuestions(input.properties.info.id)
-        await dismissSessionPermissions(input.properties.info.id)
-        if (!input.properties.info.parentID) {
-          await dismissCompletion(input.properties.info.id, true)
-        }
-      }
-      if (
-        input.type === "session.updated" &&
-        "archived" in input.properties.info.time &&
-        input.properties.info.time.archived
-      ) {
-        invalidateCompletion(input.properties.info.id)
-        await dismissSessionQuestions(input.properties.info.id)
-        await dismissSessionPermissions(input.properties.info.id)
-        if (!input.properties.info.parentID) {
-          await dismissCompletion(input.properties.info.id, true)
-        }
-      }
-      if (input.type === "question.asked") {
-        await notifyQuestion(input.properties)
-      }
-      if (input.type === "question.replied" || input.type === "question.rejected") {
-        await dismissQuestion(input.properties.requestID)
-      }
-      if (input.type === "permission.asked") {
-        await notifyPermission(input.properties)
-      }
-      if (input.type === "permission.replied") {
-        await dismissPermission(input.properties.requestID)
-      }
-    },
-    "chat.message": async ({ sessionID }) => {
-      invalidateCompletion(sessionID)
-      await dismissCompletion(sessionID)
-    },
-    dispose: async () => {
+    }
+    if (event.type === "form.created") {
+      await notifyQuestion(event.data.form)
+    }
+    if (event.type === "form.replied" || event.type === "form.cancelled") {
+      await dismissQuestion(event.data.id)
+    }
+    if (event.type === "permission.asked") {
+      await notifyPermission(event.data)
+    }
+    if (event.type === "permission.replied") {
+      await dismissPermission(event.data.requestID)
+    }
+  }
+
+  const handlePrompt = async (sessionID: string) => {
+    invalidateCompletion(sessionID)
+    await dismissCompletion(sessionID)
+  }
+
+  const dispose = async () => {
       disposed = true
       await Promise.all(
         [...notificationOperations.keys()].map((sequenceID) =>
@@ -395,8 +377,45 @@ export const NtfyPlugin = (async ({ client, directory }, options) => {
       )
       requests.clear()
       permissionRequests.clear()
-    },
+      rootSessions.clear()
   }
-}) satisfies Plugin
 
-export default NtfyPlugin
+  return {
+    handleEvent,
+    handlePrompt,
+    dispose,
+  }
+}
+
+export default Plugin.define({
+  id: "opencode-ntfy",
+  async setup(ctx) {
+    const runtime = await createNtfyRuntime(ctx)
+    const controller = new AbortController()
+    const tasks = new Set<Promise<void>>()
+
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          const task = runtime.handleEvent(event)
+          tasks.add(task)
+          void task.finally(() => tasks.delete(task))
+        }
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.error(`[opencode-ntfy] event subscription failed: ${String(error)}`)
+        }
+      }
+    })()
+
+    await ctx.session.hook("prompt", async (event) => {
+      await runtime.handlePrompt(event.sessionID)
+    })
+
+    return async () => {
+      controller.abort()
+      await Promise.all([...tasks])
+      await runtime.dispose()
+    }
+  },
+})

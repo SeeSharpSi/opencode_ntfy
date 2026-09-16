@@ -1,0 +1,16 @@
+{
+  "name": "opencode-ntfy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test index.test.mjs",
+    "typecheck": "tsc --noEmit --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.2"
+  }
+}

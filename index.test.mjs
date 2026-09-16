@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { NtfyPlugin } from "./index.ts"
+import { createNtfyRuntime } from "./index.ts"
 
 const environmentNames = [
   "NTFY_TOPIC",
@@ -32,6 +32,55 @@ const input = {
     },
   },
   directory: "/tmp/opencode-ntfy-test",
+}
+
+const toV2Event = (event) => {
+  const data = event.properties
+  if (event.type === "question.asked") {
+    return {
+      type: "form.created",
+      data: {
+        form: {
+          id: data.id,
+          sessionID: data.sessionID,
+          title: "Question",
+          fields: [],
+        },
+      },
+    }
+  }
+  if (event.type === "question.replied") {
+    return { type: "form.replied", data: { id: data.requestID, sessionID: data.sessionID } }
+  }
+  if (event.type === "question.rejected") {
+    return { type: "form.cancelled", data: { id: data.requestID, sessionID: data.sessionID } }
+  }
+  if (event.type === "session.deleted") {
+    return { type: "session.deleted", data: { sessionID: data.info.id } }
+  }
+  return { type: event.type, data }
+}
+
+const NtfyPlugin = async (legacyInput, options) => {
+  const runtime = await createNtfyRuntime({
+    options,
+    session: {
+      get: async ({ sessionID }) => {
+        const response = await legacyInput.client.session.get({
+          path: { id: sessionID },
+          query: { directory: legacyInput.directory },
+          throwOnError: true,
+        })
+        return response.data
+      },
+    },
+  })
+
+  return {
+    event: ({ event }) => runtime.handleEvent(toV2Event(event)),
+    "chat.message": ({ sessionID }) => runtime.handlePrompt(sessionID),
+    dispose: runtime.dispose,
+  }
 }
 
 test("plugin options override environment for question notifications", { timeout: 1000 }, async () => {
