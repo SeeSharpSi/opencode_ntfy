@@ -787,3 +787,192 @@ for (const [type, shouldPublish] of [
     }
   })
 }
+
+// OpenCode 2 runs one plugin instance per active location (project directory), and
+// location-less bus events such as session.execution.succeeded reach every
+// instance. Each session must be notified once, by the instance for its location.
+const setupInstance = async (plugin, { location, topic, sessions }) => {
+  let emit
+  const queue = []
+  let wake
+  const closed = { value: false }
+  const ctx = {
+    options: { topic, server: "https://ntfy.example.com" },
+    ...(location === undefined ? {} : { location: { directory: location } }),
+    session: {
+      get: async ({ sessionID }) => {
+        const session = sessions[sessionID]
+        if (!session) throw new Error(`session not found: ${sessionID}`)
+        return session
+      },
+      hook: async () => {},
+    },
+    event: {
+      subscribe: () => ({
+        async *[Symbol.asyncIterator]() {
+          while (!closed.value) {
+            if (queue.length > 0) yield queue.shift()
+            else await new Promise((resolve) => { wake = resolve })
+          }
+        },
+      }),
+    },
+  }
+  emit = (event) => { queue.push(event); wake?.() }
+  const setup = plugin.setup ?? plugin.default?.setup
+  const dispose = await setup(ctx)
+  return {
+    ctx,
+    emit,
+    dispose: async () => { closed.value = true; wake?.(); await dispose() },
+  }
+}
+
+const captureNtfy = () => {
+  const originalFetch = globalThis.fetch
+  const published = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (options.method === "POST") {
+      published.push(JSON.parse(options.body))
+      return new Response(null, { status: 200 })
+    }
+    if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+    throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
+  }
+  return { published, restore: () => { globalThis.fetch = originalFetch } }
+}
+
+const settle = async (published, count) => {
+  for (let i = 0; i < 100 && published.length < count; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  // Give a duplicate the same chance to arrive before asserting there is none.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+}
+
+test("each location's instance notifies only for sessions at its location", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  const sessions = {
+    "session-a": { title: "A", location: { directory: "/work/a" } },
+    "session-b": { title: "B", location: { directory: "/work/b" } },
+  }
+  const a = await setupInstance(plugin, { location: "/work/a", topic: "topic-a", sessions })
+  const b = await setupInstance(plugin, { location: "/work/b", topic: "topic-b", sessions })
+  try {
+    for (const sessionID of ["session-a", "session-b"]) {
+      const event = { id: `evt_${sessionID}`, type: "session.execution.succeeded", data: { sessionID } }
+      a.emit(event)
+      b.emit(event)
+    }
+    await settle(ntfy.published, 2)
+    assert.deepEqual(ntfy.published.map((message) => message.topic).sort(), ["topic-a", "topic-b"])
+  } finally {
+    await a.dispose()
+    await b.dispose()
+    ntfy.restore()
+  }
+})
+
+test("each location's instance raises permission requests only for its own sessions", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  const sessions = {
+    "session-a": { title: "A", location: { directory: "/work/a" } },
+  }
+  const a = await setupInstance(plugin, { location: "/work/a", topic: "topic-a", sessions })
+  const b = await setupInstance(plugin, { location: "/work/b", topic: "topic-b", sessions })
+  try {
+    const event = { id: "evt_perm", type: "permission.asked", data: { id: "per_1", sessionID: "session-a" } }
+    a.emit(event)
+    b.emit(event)
+    await settle(ntfy.published, 1)
+    assert.deepEqual(ntfy.published.map((message) => message.topic), ["topic-a"])
+  } finally {
+    await a.dispose()
+    await b.dispose()
+    ntfy.restore()
+  }
+})
+
+test("an instance without a location still notifies for every session", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  const sessions = { "session-a": { title: "A", location: { directory: "/work/a" } } }
+  const instance = await setupInstance(plugin, { location: undefined, topic: "topic", sessions })
+  try {
+    instance.emit({ id: "evt_1", type: "session.execution.succeeded", data: { sessionID: "session-a" } })
+    await settle(ntfy.published, 1)
+    assert.equal(ntfy.published.length, 1)
+  } finally {
+    await instance.dispose()
+    ntfy.restore()
+  }
+})
+
+test("each location's instance raises questions only for its own sessions", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  const sessions = { "session-b": { title: "B", location: { directory: "/work/b" } } }
+  const a = await setupInstance(plugin, { location: "/work/a", topic: "topic-a", sessions })
+  const b = await setupInstance(plugin, { location: "/work/b", topic: "topic-b", sessions })
+  try {
+    const event = { id: "evt_form", type: "form.created", data: { form: { id: "frm_1", sessionID: "session-b" } } }
+    a.emit(event)
+    b.emit(event)
+    await settle(ntfy.published, 1)
+    assert.deepEqual(ntfy.published.map((message) => message.topic), ["topic-b"])
+  } finally {
+    await a.dispose()
+    await b.dispose()
+    ntfy.restore()
+  }
+})
+
+test("a failed session lookup publishes nothing and is retried on the next event", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  let failNext = true
+  const sessions = new Proxy({}, {
+    get: (_, sessionID) => {
+      if (failNext) { failNext = false; return undefined }
+      return sessionID === "session-a" ? { title: "A", location: { directory: "/work/a" } } : undefined
+    },
+  })
+  const a = await setupInstance(plugin, { location: "/work/a", topic: "topic-a", sessions })
+  try {
+    a.emit({ id: "evt_1", type: "session.execution.succeeded", data: { sessionID: "session-a" } })
+    await settle(ntfy.published, 1)
+    assert.equal(ntfy.published.length, 0)
+    a.emit({ id: "evt_2", type: "session.execution.succeeded", data: { sessionID: "session-a" } })
+    await settle(ntfy.published, 1)
+    assert.deepEqual(ntfy.published.map((message) => message.topic), ["topic-a"])
+  } finally {
+    await a.dispose()
+    ntfy.restore()
+  }
+})
+
+test("a reply is not overtaken by the ownership lookup for its request", { timeout: 3000 }, async () => {
+  const { default: plugin } = await import("./index.ts")
+  const ntfy = captureNtfy()
+  const session = { title: "A", location: { directory: "/work/a" } }
+  const sessions = new Proxy({}, {
+    get: () => session,
+  })
+  const a = await setupInstance(plugin, { location: "/work/a", topic: "topic-a", sessions })
+  const slowGet = a.ctx.session.get
+  a.ctx.session.get = async (input) => {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    return slowGet(input)
+  }
+  try {
+    a.emit({ id: "evt_ask", type: "permission.asked", data: { id: "per_1", sessionID: "session-a" } })
+    a.emit({ id: "evt_reply", type: "permission.replied", data: { requestID: "per_1" } })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(ntfy.published.length, 0)
+  } finally {
+    await a.dispose()
+    ntfy.restore()
+  }
+})
