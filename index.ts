@@ -338,8 +338,15 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   }
 
   const handleEvent = async (event: OpenCodeEvent) => {
-    if (event.type === "session.idle") {
-      await notifyFinished(event.data.sessionID)
+    // OpenCode 2.0.7 ends a turn on the plugin bus with `session.execution.succeeded`
+    // or `.failed` and does not deliver `session.idle` there; keep `session.idle` for
+    // hosts that still emit it. An interrupted turn was stopped by a present user.
+    if (
+      event.type === "session.idle" ||
+      (event.type as string) === "session.execution.succeeded" ||
+      (event.type as string) === "session.execution.failed"
+    ) {
+      await notifyFinished((event as { data: { sessionID: string } }).data.sessionID)
     }
     if (event.type === "session.deleted") {
       invalidateCompletion(event.data.sessionID)
@@ -387,17 +394,98 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   }
 }
 
+// The session a notification-raising event is about. Other events (dismissals,
+// deletions) only act on requests this instance itself tracks, so every instance
+// can handle them.
+const notifyingSessionID = (event: OpenCodeEvent): string | undefined => {
+  const type = event.type as string
+  const data = (event as { data?: Record<string, unknown> }).data
+  if (
+    type === "session.idle" ||
+    type === "session.execution.succeeded" ||
+    type === "session.execution.failed" ||
+    type === "permission.asked"
+  ) {
+    return typeof data?.sessionID === "string" ? data.sessionID : undefined
+  }
+  if (type === "form.created") {
+    const form = data?.form as { sessionID?: unknown } | undefined
+    return typeof form?.sessionID === "string" ? form.sessionID : undefined
+  }
+  return undefined
+}
+
+const ownedSessionCacheLimit = 1000
+
+// OpenCode 2 runs one instance of this plugin per active location (project
+// directory), and location-less bus events such as session.execution.succeeded
+// reach every instance, so each notification was published once per open project,
+// to each project's topic. An instance now raises notifications only for sessions
+// at its own location. Without a location on either side (older hosts), it keeps
+// the previous behaviour and handles every session. A failed lookup is treated as
+// not ours and not cached: publishing anyway could put the notification on another
+// project's topic, where the prompt hook (which fires only at the session's own
+// location) would never clear it.
+const createLocationFilter = (ctx: {
+  readonly location?: { readonly directory?: string }
+  readonly session: NtfyContext["session"]
+}) => {
+  const directory = ctx.location?.directory
+  const owned = new Map<string, Promise<boolean>>()
+  const lookup = async (sessionID: string) => {
+    try {
+      const session = (await ctx.session.get({ sessionID })) as {
+        location?: { directory?: string }
+      }
+      const sessionDirectory = session?.location?.directory
+      return sessionDirectory === undefined || sessionDirectory === directory
+    } catch {
+      // Not cached, so the next event for this session asks again.
+      owned.delete(sessionID)
+      return false
+    }
+  }
+  return {
+    handles: async (event: OpenCodeEvent) => {
+      if (directory === undefined) return true
+      if ((event.type as string) === "session.deleted") {
+        const sessionID = (event as { data?: { sessionID?: unknown } }).data?.sessionID
+        if (typeof sessionID === "string") owned.delete(sessionID)
+        return true
+      }
+      const sessionID = notifyingSessionID(event)
+      if (sessionID === undefined) return true
+      let result = owned.get(sessionID)
+      if (result === undefined) {
+        result = lookup(sessionID)
+        owned.set(sessionID, result)
+        if (owned.size > ownedSessionCacheLimit) {
+          const oldest = owned.keys().next().value
+          if (oldest !== undefined) owned.delete(oldest)
+        }
+      }
+      return result
+    },
+  }
+}
+
 export default Plugin.define({
   id: "opencode-ntfy",
   async setup(ctx) {
     const runtime = await createNtfyRuntime(ctx)
+    const locationFilter = createLocationFilter(ctx)
+    // Ownership is decided one event at a time, so events reach the runtime in bus
+    // order: a reply must not overtake the lookup for the request it answers.
+    let decided: Promise<unknown> = Promise.resolve()
     const controller = new AbortController()
     const tasks = new Set<Promise<void>>()
 
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          const task = runtime.handleEvent(event)
+          const handles = decided.then(() => locationFilter.handles(event))
+          decided = handles
+          const task = handles.then((owned) => (owned ? runtime.handleEvent(event) : undefined))
           tasks.add(task)
           void task.finally(() => tasks.delete(task))
         }
