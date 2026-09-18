@@ -751,3 +751,39 @@ test("network completion publish errors log unreachable hint without stack", { t
     }
   }
 })
+
+// OpenCode 2.0.7's plugin event bus ends a turn with `session.execution.succeeded`
+// (or `.failed`) and does not deliver `session.idle` to plugins, so completion
+// notifications must also follow the execution events. An interrupted turn was
+// stopped by the user, who is by definition present, so it does not notify.
+for (const [type, shouldPublish] of [
+  ["session.execution.succeeded", true],
+  ["session.execution.failed", true],
+  ["session.execution.interrupted", false],
+]) {
+  test(`${type} ${shouldPublish ? "publishes" : "does not publish"} a completion notification`, { timeout: 1000 }, async () => {
+    const originalFetch = globalThis.fetch
+    const published = []
+    globalThis.fetch = async (url, options = {}) => {
+      if (options.method === "POST") {
+        published.push(JSON.parse(options.body))
+        return new Response(null, { status: 200 })
+      }
+      if (String(url).endsWith("/clear")) return new Response(null, { status: 200 })
+      throw new Error(`unexpected request: ${options.method ?? "GET"} ${url}`)
+    }
+    const hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    try {
+      await hooks.event({ event: { type, properties: { sessionID: "session-id" } } })
+      if (shouldPublish) {
+        assert.equal(published.length, 1)
+        assert.equal(published[0].sequence_id, "opencode-session-id")
+      } else {
+        assert.equal(published.length, 0)
+      }
+    } finally {
+      await hooks.dispose()
+      globalThis.fetch = originalFetch
+    }
+  })
+}

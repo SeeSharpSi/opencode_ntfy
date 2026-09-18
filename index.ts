@@ -338,8 +338,15 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   }
 
   const handleEvent = async (event: OpenCodeEvent) => {
-    if (event.type === "session.idle") {
-      await notifyFinished(event.data.sessionID)
+    // OpenCode 2.0.7 ends a turn on the plugin bus with `session.execution.succeeded`
+    // or `.failed` and does not deliver `session.idle` there; keep `session.idle` for
+    // hosts that still emit it. An interrupted turn was stopped by a present user.
+    if (
+      event.type === "session.idle" ||
+      (event.type as string) === "session.execution.succeeded" ||
+      (event.type as string) === "session.execution.failed"
+    ) {
+      await notifyFinished((event as { data: { sessionID: string } }).data.sessionID)
     }
     if (event.type === "session.deleted") {
       invalidateCompletion(event.data.sessionID)
