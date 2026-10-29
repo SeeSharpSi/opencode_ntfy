@@ -26,6 +26,7 @@ The plugin accepts these options, with environment-variable fallbacks:
 | `password` | `NTFY_PASSWORD` | none |
 | `allowInsecureHttp` | `NTFY_ALLOW_INSECURE_HTTP` | `false` |
 | `hideChatContent` | `NTFY_HIDE_CHAT_CONTENT` | `true` |
+| `showProjectDirectory` | `NTFY_SHOW_PROJECT_DIRECTORY` | `false` |
 | `priority` | `NTFY_PRIORITY` | `4` |
 | `requestTimeoutMs` | `NTFY_REQUEST_TIMEOUT_MS` | `5000` |
 | `retryAttempts` | `NTFY_RETRY_ATTEMPTS` | `3` |
@@ -60,6 +61,29 @@ permission, and question notices. Set `hideChatContent` to `false`, or set
 `NTFY_HIDE_CHAT_CONTENT` to `0`, `false`, `no`, or `off`, to include the current
 session title. Question notifications never include prompts, descriptions, or
 answer options.
+
+Project directory names are omitted by default. Set `showProjectDirectory` to
+`true`, or set `NTFY_SHOW_PROJECT_DIRECTORY` to `true`, `1`, `yes`, or `on`, to
+append the basename of the session's directory as a second plain-text line in
+the notification body. This is independent of `hideChatContent`: it never
+includes the full path and does not change title hiding. If the directory is
+unknown, empty, or a filesystem root, the body is unchanged. Invalid values
+reject setup. To opt in, add the option to the plugin configuration:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-ntfy",
+      "options": {
+        "topic": "replace-with-random-topic",
+        "showProjectDirectory": true
+      }
+    }
+  ]
+}
+```
 
 Use an unguessable topic name. A topic on a public ntfy server is effectively a password.
 

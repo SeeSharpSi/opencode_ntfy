@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { basename } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import type { OpenCodeEvent } from "@opencode/client"
 import {
@@ -447,6 +448,13 @@ export async function createNtfyRuntime(ctx: NtfyContext, runtimeOptions: Runtim
     "NTFY_ALLOW_INSECURE_HTTP",
     false,
   )
+  const showProjectDirectory = readBooleanSetting(
+    options,
+    environment,
+    "showProjectDirectory",
+    "NTFY_SHOW_PROJECT_DIRECTORY",
+    false,
+  )
 
   const server = parseServerUrl(
     pluginOption("server") ??
@@ -529,6 +537,15 @@ export async function createNtfyRuntime(ctx: NtfyContext, runtimeOptions: Runtim
   const answeredPermissions = new Map<string, number>()
   const bufferedEvents: NotificationEvent[] = []
   const dirtySessionEpoch = new Map<string, number>()
+
+  const notificationMessage = (sessionID: string, message: string) => {
+    if (!showProjectDirectory) return message
+    const directory = sessionStates.get(sessionID)?.location ?? locationDirectory
+    if (directory === undefined) return message
+    const name = basename(directory)
+    if (name.trim() === "" || name === "/" || name === "." || name === "..") return message
+    return `${message}\n${name}`
+  }
 
   let disposed = false
   let disposePromise: Promise<void> | undefined
@@ -1528,7 +1545,7 @@ export async function createNtfyRuntime(ctx: NtfyContext, runtimeOptions: Runtim
           token,
           {
             title: hideChatContent ? "OpenCode" : metadata.title,
-            message: "Response finished",
+            message: notificationMessage(sessionID, "Response finished"),
             priority,
           },
           () => isValid() && !isBlocked(sessionID),
@@ -1784,7 +1801,10 @@ export async function createNtfyRuntime(ctx: NtfyContext, runtimeOptions: Runtim
         token,
         {
           title: hideChatContent ? "OpenCode" : title,
-          message: entry.kind === "question" ? "Question posed" : "Permissions request",
+          message: notificationMessage(
+            entry.sessionID,
+            entry.kind === "question" ? "Question posed" : "Permissions request",
+          ),
           priority,
         },
         isCurrent,

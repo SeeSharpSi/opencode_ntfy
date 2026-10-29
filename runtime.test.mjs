@@ -15,6 +15,7 @@ const environmentNames = [
   "NTFY_PASSWORD",
   "NTFY_ALLOW_INSECURE_HTTP",
   "NTFY_HIDE_CHAT_CONTENT",
+  "NTFY_SHOW_PROJECT_DIRECTORY",
   "NTFY_REQUEST_TIMEOUT_MS",
   "NTFY_RETRY_ATTEMPTS",
   "NTFY_RETRY_DELAY_MS",
@@ -3485,3 +3486,265 @@ test(
     }
   },
 )
+
+const publishProjectDirectoryAlerts = async (runtime, mock, suffix) => {
+  const completionID = `project-dir-completion-${suffix}`
+  const questionID = `project-dir-question-${suffix}`
+  const permissionID = `project-dir-permission-${suffix}`
+  await runtime.handleEvent(executionSucceededEvent(completionID))
+  await runtime.handleEvent(questionEvent(questionID, questionID))
+  await runtime.handleEvent(permissionEvent(permissionID, permissionID))
+  return [
+    {
+      request: postsFor(mock, `opencode-${completionID}`)[0],
+      message: "Response finished",
+    },
+    {
+      request: postsFor(mock, `opencode-question-${questionID}`)[0],
+      message: "Question posed",
+    },
+    {
+      request: postsFor(mock, `opencode-permission-${permissionID}`)[0],
+      message: "Permissions request",
+    },
+  ]
+}
+
+test(
+  "project directory suffix is absent by default and when explicitly disabled",
+  { timeout: 2500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const contextDirectory = "/tmp/context-project"
+    let defaultRuntime
+    let disabledRuntime
+    try {
+      ;({ runtime: defaultRuntime } = await makeRuntime({
+        location: { directory: contextDirectory },
+      }))
+      for (const alert of await publishProjectDirectoryAlerts(
+        defaultRuntime,
+        mock,
+        "default",
+      )) {
+        assert.ok(alert.request, "expected every alert type to publish")
+        assert.equal(alert.request.body.message, alert.message)
+        assert.ok(!JSON.stringify(alert.request.body).includes("context-project"))
+        assert.ok(!JSON.stringify(alert.request.body).includes(contextDirectory))
+      }
+
+      ;({ runtime: disabledRuntime } = await makeRuntime({
+        location: { directory: contextDirectory },
+        options: { showProjectDirectory: false },
+      }))
+      for (const alert of await publishProjectDirectoryAlerts(
+        disabledRuntime,
+        mock,
+        "disabled",
+      )) {
+        assert.ok(alert.request, "expected every alert type to publish")
+        assert.equal(alert.request.body.message, alert.message)
+        assert.ok(!JSON.stringify(alert.request.body).includes("context-project"))
+        assert.ok(!JSON.stringify(alert.request.body).includes(contextDirectory))
+      }
+    } finally {
+      if (defaultRuntime) await disposeQuietly(defaultRuntime)
+      if (disabledRuntime) await disposeQuietly(disabledRuntime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "showProjectDirectory appends only the basename to every alert type",
+  { timeout: 2500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const contextDirectory = "/tmp/context-project/"
+    const completionID = "project-dir-completion-enabled"
+    const { runtime, lookups } = await makeRuntime({
+      location: { directory: contextDirectory },
+      get: async ({ sessionID }) => {
+        if (sessionID === completionID) return { title: "Test session", sessionID }
+        throw new Error("hidden request titles must not be looked up")
+      },
+      options: { showProjectDirectory: true },
+    })
+    try {
+      for (const alert of await publishProjectDirectoryAlerts(
+        runtime,
+        mock,
+        "enabled",
+      )) {
+        assert.ok(alert.request, "expected every alert type to publish")
+        assert.equal(alert.request.body.message, `${alert.message}\ncontext-project`)
+        assert.ok(!JSON.stringify(alert.request.body).includes(contextDirectory))
+      }
+      assert.deepEqual(lookups, [completionID])
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "cached session directories take precedence over the plugin context",
+  { timeout: 2500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const contextDirectory = "/tmp/context-project"
+    const cachedDirectory = "/tmp/cached-project/"
+    const completionID = "project-dir-cached-completion"
+    const requestSessionID = "project-dir-cached-requests"
+    const { runtime, lookups } = await makeRuntime({
+      location: { directory: contextDirectory, workspaceID: "workspace-current" },
+      options: { showProjectDirectory: true },
+    })
+    try {
+      for (const id of [completionID, requestSessionID]) {
+        await runtime.handleEvent(
+          nativeCreatedEvent(
+            id,
+            1,
+            cachedDirectory,
+            "workspace-current",
+            "Cached project session",
+            "project-id",
+          ),
+        )
+      }
+      await runtime.handleEvent(executionSucceededEvent(completionID))
+      await runtime.handleEvent(
+        questionEvent("project-dir-cached-question", requestSessionID),
+      )
+      await runtime.handleEvent(
+        permissionEvent("project-dir-cached-permission", requestSessionID),
+      )
+
+      const alerts = [
+        {
+          request: postsFor(mock, `opencode-${completionID}`)[0],
+          message: "Response finished",
+        },
+        {
+          request: postsFor(mock, "opencode-question-project-dir-cached-question")[0],
+          message: "Question posed",
+        },
+        {
+          request: postsFor(mock, "opencode-permission-project-dir-cached-permission")[0],
+          message: "Permissions request",
+        },
+      ]
+      for (const alert of alerts) {
+        assert.ok(alert.request, "expected every alert type to publish")
+        assert.equal(alert.request.body.message, `${alert.message}\ncached-project`)
+        assert.ok(!JSON.stringify(alert.request.body).includes(cachedDirectory.trim()))
+        assert.ok(!JSON.stringify(alert.request.body).includes(contextDirectory))
+      }
+      assert.equal(lookups.length, 0)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "missing, empty, and root directories leave the message unchanged",
+  { timeout: 3000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const cases = [
+      ["missing", undefined],
+      ["empty", { directory: "" }],
+      ["root", { directory: "/" }],
+    ]
+    const runtimes = []
+    try {
+      for (const [name, location] of cases) {
+        const { runtime } = await makeRuntime(location ? { location } : {})
+        runtimes.push(runtime)
+        for (const alert of await publishProjectDirectoryAlerts(runtime, mock, name)) {
+          assert.ok(alert.request, `expected ${name} alert to publish`)
+          assert.equal(alert.request.body.message, alert.message)
+        }
+      }
+    } finally {
+      for (const runtime of runtimes) await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "showProjectDirectory environment enables the suffix and an option can disable it",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    process.env.NTFY_SHOW_PROJECT_DIRECTORY = "true"
+    let environmentRuntime
+    let optionRuntime
+    try {
+      ;({ runtime: environmentRuntime } = await makeRuntime({
+        location: { directory: "/tmp/environment-project" },
+      }))
+      await environmentRuntime.handleEvent(
+        questionEvent("project-dir-environment-question", "project-dir-environment"),
+      )
+      assert.equal(
+        postsFor(mock, "opencode-question-project-dir-environment-question")[0].body
+          .message,
+        "Question posed\nenvironment-project",
+      )
+
+      ;({ runtime: optionRuntime } = await makeRuntime({
+        location: { directory: "/tmp/environment-project" },
+        options: { showProjectDirectory: false },
+      }))
+      await optionRuntime.handleEvent(
+        questionEvent("project-dir-option-false-question", "project-dir-option-false"),
+      )
+      assert.equal(
+        postsFor(mock, "opencode-question-project-dir-option-false-question")[0].body
+          .message,
+        "Question posed",
+      )
+    } finally {
+      delete process.env.NTFY_SHOW_PROJECT_DIRECTORY
+      if (environmentRuntime) await disposeQuietly(environmentRuntime)
+      if (optionRuntime) await disposeQuietly(optionRuntime)
+      restoreFetch()
+    }
+  },
+)
+
+test("invalid showProjectDirectory values reject setup", { timeout: 1000 }, async () => {
+  const context = {
+    session: { get: async () => ({ title: "Test session" }) },
+  }
+  for (const showProjectDirectory of ["true", 1, null]) {
+    await assert.rejects(
+      createNtfyRuntime({
+        ...context,
+        options: { ...baseOptions, showProjectDirectory },
+      }),
+      /showProjectDirectory must be a boolean/,
+    )
+  }
+
+  process.env.NTFY_SHOW_PROJECT_DIRECTORY = "sometimes"
+  try {
+    await assert.rejects(
+      createNtfyRuntime({ ...context, options: { ...baseOptions } }),
+      /NTFY_SHOW_PROJECT_DIRECTORY for showProjectDirectory must be true or false/,
+    )
+  } finally {
+    delete process.env.NTFY_SHOW_PROJECT_DIRECTORY
+  }
+})
