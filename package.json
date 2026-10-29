@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --import tsx --test index.test.mjs",
+    "test": "node --import tsx --test *.test.mjs",
     "typecheck": "tsc --noEmit --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 index.ts"
   },
   "dependencies": {

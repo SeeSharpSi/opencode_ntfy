@@ -11,6 +11,11 @@ const environmentNames = [
   "NTFY_USERNAME",
   "NTFY_PASSWORD",
   "NTFY_HIDE_CHAT_CONTENT",
+  "NTFY_REQUEST_TIMEOUT_MS",
+  "NTFY_RETRY_ATTEMPTS",
+  "NTFY_RETRY_DELAY_MS",
+  "NTFY_PERMISSION_DELAY_MS",
+  "NTFY_PRIORITY",
 ]
 const savedEnvironment = new Map(environmentNames.map((name) => [name, process.env[name]]))
 
@@ -157,24 +162,33 @@ test("plugin options override environment for question notifications", { timeout
   }
 })
 
-test("dispose waits for an in-flight completion publish before clearing it", { timeout: 1000 }, async () => {
+test("dispose cancels an in-flight completion publish and clears it", { timeout: 1000 }, async () => {
   const originalFetch = globalThis.fetch
   const operations = []
   let resolvePublishStarted
-  let resolvePublish
   const publishStarted = new Promise((resolve) => {
     resolvePublishStarted = resolve
-  })
-  const publishReleased = new Promise((resolve) => {
-    resolvePublish = resolve
   })
 
   globalThis.fetch = async (url, options = {}) => {
     if (options.method === "POST") {
       operations.push("publish started")
       resolvePublishStarted()
-      await publishReleased
-      operations.push("publish finished")
+      await new Promise((resolve) => {
+        if (options.signal?.aborted) {
+          operations.push("publish aborted")
+          resolve()
+          return
+        }
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            operations.push("publish aborted")
+            resolve()
+          },
+          { once: true },
+        )
+      })
       return new Response(null, { status: 200 })
     }
     if (String(url).endsWith("/clear")) {
@@ -195,10 +209,9 @@ test("dispose waits for an in-flight completion publish before clearing it", { t
     })
     await publishStarted
     const disposal = hooks.dispose()
-    resolvePublish()
     await Promise.all([idle, disposal])
 
-    assert.deepEqual(operations, ["publish started", "publish finished", "clear"])
+    assert.deepEqual(operations, ["publish started", "publish aborted", "clear"])
   } finally {
     await hooks.dispose()
     globalThis.fetch = originalFetch
@@ -565,6 +578,7 @@ test("rejected question cannot publish after its session lookup resolves", { tim
   const hooks = await NtfyPlugin(delayedInput, {
     topic: "test-topic",
     server: "https://ntfy.example.com",
+    hideChatContent: false,
   })
 
   try {
@@ -615,7 +629,11 @@ test("failed completion publish logs actionable ntfy JSON errors", { timeout: 10
 
   let hooks
   try {
-    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    hooks = await NtfyPlugin(input, {
+      topic: "test-topic",
+      server: "https://ntfy.example.com",
+      retryAttempts: 1,
+    })
     await hooks.event({
       event: { type: "session.idle", properties: { sessionID: "session-id" } },
     })
@@ -658,19 +676,35 @@ test("identical failed completion publishes are suppressed until recovery", { ti
 
   let hooks
   try {
-    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
-    const idle = () =>
-      hooks.event({
+    hooks = await NtfyPlugin(input, {
+      topic: "test-topic",
+      server: "https://ntfy.example.com",
+      retryAttempts: 1,
+    })
+    const cycle = async () => {
+      // A retry status starts a new activity generation without clearing the
+      // previous failed completion, so this keeps exercising failure dedup.
+      await hooks.event({
+        event: {
+          type: "session.status",
+          properties: {
+            sessionID: "session-id",
+            status: { type: "retry", attempt: 1, message: "retrying", next: 1 },
+          },
+        },
+      })
+      await hooks.event({
         event: { type: "session.idle", properties: { sessionID: "session-id" } },
       })
+    }
 
-    await idle()
-    await idle()
+    await cycle()
+    await cycle()
     assert.equal(calls.length, 1)
-    await idle()
+    await cycle()
     assert.equal(calls.length, 2)
     assert.match(calls[1][0], /recovered \(1 identical failure\(s\) suppressed\)/)
-    await idle()
+    await cycle()
     assert.equal(calls.length, 3)
     assert.match(calls[2][0], /ntfy publish failed/)
     assert.equal(responses.length, 0)
@@ -698,7 +732,11 @@ test("non-JSON completion publish errors are bounded and one-line", { timeout: 1
 
   let hooks
   try {
-    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    hooks = await NtfyPlugin(input, {
+      topic: "test-topic",
+      server: "https://ntfy.example.com",
+      retryAttempts: 1,
+    })
     await hooks.event({
       event: { type: "session.idle", properties: { sessionID: "session-id" } },
     })
@@ -730,7 +768,11 @@ test("network completion publish errors log unreachable hint without stack", { t
 
   let hooks
   try {
-    hooks = await NtfyPlugin(input, { topic: "test-topic", server: "https://ntfy.example.com" })
+    hooks = await NtfyPlugin(input, {
+      topic: "test-topic",
+      server: "https://ntfy.example.com",
+      retryAttempts: 1,
+    })
     await hooks.event({
       event: { type: "session.idle", properties: { sessionID: "session-id" } },
     })

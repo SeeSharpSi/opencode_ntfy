@@ -5,10 +5,10 @@ A small local OpenCode plugin that:
 - publishes a notification when a root session becomes idle;
 - publishes a notification when OpenCode needs permission, unless auto-approve answers it;
 - dismisses completion, permission, and question notifications when they become stale or OpenCode shuts down cleanly;
-- publishes a simple notification for `question.asked` events;
+- publishes a simple notification for `form.created` events;
 - hides chat-derived session titles by default, with an explicit opt-out.
 
-This directory is deliberately outside `.opencode/plugin`, so merely having it here does not install or enable it.
+This directory is deliberately outside `.opencode/plugins`, so merely having it here does not install or enable it.
 
 ## Configuration
 
@@ -22,12 +22,33 @@ The plugin accepts these options, with environment-variable fallbacks:
 | `username` | `NTFY_USERNAME` | none |
 | `password` | `NTFY_PASSWORD` | none |
 | `hideChatContent` | `NTFY_HIDE_CHAT_CONTENT` | `true` |
+| `priority` | `NTFY_PRIORITY` | `4` |
+| `requestTimeoutMs` | `NTFY_REQUEST_TIMEOUT_MS` | `5000` |
+| `retryAttempts` | `NTFY_RETRY_ATTEMPTS` | `3` |
+| `retryDelayMs` | `NTFY_RETRY_DELAY_MS` | `250` |
+| `permissionDelayMs` | `NTFY_PERMISSION_DELAY_MS` | `100` |
 
 `url` and `NTFY_URL` remain supported as aliases for `server` and `NTFY_SERVER`.
 Plugin options take precedence over environment variables. If any primary
 authentication option (`token`, `username`, or `password`) is present, the
 plugin ignores all primary authentication environment variables instead of
 mixing credentials from both sources.
+
+The numeric settings are bounded. `requestTimeoutMs` must be a finite integer
+from 1 to 120000 milliseconds. `retryAttempts` is the total number of attempts,
+including the first, and must be a finite integer from 1 to 5. `retryDelayMs` is
+the initial delay for exponential retry backoff and must be a finite integer
+from 0 to 30000 milliseconds. `permissionDelayMs` is the delay before publishing
+a permission alert, allowing automatic replies to cancel it during that grace
+period, and must be a finite integer from 0 to 60000 milliseconds. Supply
+numeric plugin options as JSON numbers; environment variables are numeric
+strings. Out-of-range and non-numeric values reject setup instead of silently
+falling back to a default.
+
+`priority` must be a finite integer from 1 to 5 and applies to completion,
+question, and permission alerts. The default is 4, which ntfy Android treats as
+high messaging priority, so push delivery is consistent across alert types. Set
+`priority` to 3, or `NTFY_PRIORITY` to `3`, to choose normal priority explicitly.
 
 Chat-derived text is excluded from ntfy payloads by default. Notifications use
 `OpenCode` as their title and retain generic event text such as completion,
@@ -56,8 +77,12 @@ If you later choose to enable the plugin, reference this file from OpenCode's na
 ```
 
 Run `npm install` in the plugin directory before loading it. This installs the
-V2 plugin API and the development tools used by the test suite. Quit and restart
-OpenCode after changing its configuration.
+V2 plugin API and the development tools used by the test suite. Restart the
+OpenCode service after updating the plugin or its configuration:
+
+```sh
+opencode service restart
+```
 
 Pass secrets through the environment inherited by the OpenCode process and omit
 them from plugin options:
@@ -88,4 +113,24 @@ Question notifications only report that OpenCode has a question. They do not sho
 
 Notification dismissal requires ntfy server 2.16.0 and ntfy Android 1.22.2 or newer. Completion notifications are dismissed when the session receives another prompt, is archived, or is deleted. Permission notifications wait briefly for an automatic answer and are not published when OpenCode auto-approves them. Published permission notifications are dismissed when answered or when their session is archived or deleted. They alert you to return to OpenCode and do not include remote approval actions. Question notifications are dismissed when answered or rejected, or when their session is archived or deleted. Closing a session tab in the Web/Desktop UI cannot dismiss notifications: tab state is client-local and OpenCode emits no plugin event for it. Quitting OpenCode dismisses all notifications created by that process when plugin shutdown completes; an abrupt process kill cannot.
 
+### Delivery behavior
+
+Completion alerts are driven primarily by the native `session.execution.succeeded` event. Idle events, including `session.idle` and status-idle fallbacks, are also observed and coalesced per activity cycle, so duplicate success or idle signals publish at most one completion notification until new activity begins another cycle. Execution failed or interrupted events do not produce success alerts. Completion notifications are published only for root sessions. When `hideChatContent` is enabled, question and permission alerts are sent without a session title lookup. If title content is enabled but the title is unavailable, request alerts fall back to `OpenCode`.
+
+Publishes and dismissals use the configured request timeout and bounded retries for network failures, timeouts, and HTTP 408, 425, 429, 500, 502, 503, and 504. Other HTTP errors, including 400, 401, 403, and 404, fail without retry. A `Retry-After` header is honored when the requested delay is 30 seconds or less. A longer delay is logged as a failure rather than retried earlier than the server allows.
+
+Retries reuse the same ntfy `sequence_id`, so retries do not create separate notification sequences. This is not an exact-once guarantee: if the server accepted a request but its HTTP response was lost, a retry can send the notification again.
+
+The event subscription reconnects automatically after a failure or end of the stream with bounded backoff. The public OpenCode event stream is live-only, so events emitted while disconnected cannot be replayed. Reconnection resumes live processing; it does not recover or resynchronize missed events.
+
+The prompt hook performs remote dismissal in the background so a slow ntfy server does not block OpenCode. Archiving or deleting a session, answering or rejecting a question, and answering a permission request cancel stale notifications. Clean shutdown attempts a bounded, best-effort clearing of notifications created by the process; an abruptly killed process cannot clear them.
+
+A successful plugin-to-server POST means the ntfy server accepted the request; it does not measure delivery to the phone, and high priority does not guarantee immediate delivery. Phone battery restrictions, network conditions, or ntfy server configuration can add delay. If alerts are delayed, check those factors together with the ntfy app's subscription and notification settings.
+
 The ntfy server URL must be reachable by both the machine running OpenCode and the phone. The OpenCode server itself remains local and does not need an exposed port.
+
+## Development checks
+
+Run `npm test` to execute every root `*.test.mjs` file, including transport and runtime coverage. Run `npm run typecheck` to typecheck `index.ts` and its imported modules.
+
+Regression coverage includes request timeouts and abort release, bounded retry and non-retry statuses, `Retry-After` limits, stalled response bodies, duplicate idle coalescing, stale completion invalidation, question and permission dismissal, auto-approval suppression, and shutdown races.
