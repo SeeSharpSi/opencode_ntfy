@@ -21,6 +21,7 @@ The plugin accepts these options, with environment-variable fallbacks:
 | `token` | `NTFY_TOKEN` | none |
 | `username` | `NTFY_USERNAME` | none |
 | `password` | `NTFY_PASSWORD` | none |
+| `allowInsecureHttp` | `NTFY_ALLOW_INSECURE_HTTP` | `false` |
 | `hideChatContent` | `NTFY_HIDE_CHAT_CONTENT` | `true` |
 | `priority` | `NTFY_PRIORITY` | `4` |
 | `requestTimeoutMs` | `NTFY_REQUEST_TIMEOUT_MS` | `5000` |
@@ -96,7 +97,19 @@ This places plaintext tokens in OpenCode configuration, so prefer environment
 variables. Keep any configuration containing secrets private and out of source
 control.
 
-The plugin does not load `.env` files. Set both `username` and `password` for primary HTTP Basic authentication, or set `token` for primary bearer authentication. The plugin rejects partial Basic credentials and configurations containing both primary authentication methods. Use HTTPS to protect credentials in transit.
+The plugin does not load `.env` files. Set both `username` and `password` for primary HTTP Basic authentication, or set `token` for primary bearer authentication. The plugin rejects partial Basic credentials and configurations containing both primary authentication methods.
+
+The server URL must use HTTP or HTTPS and cannot contain embedded credentials,
+a query string, or a fragment. Base paths are supported. Publish and dismissal
+requests reject redirects, so configure the final ntfy URL directly.
+
+Authentication requires HTTPS by default, including for loopback addresses.
+For a trusted HTTP endpoint, set `allowInsecureHttp` to `true` or
+`NTFY_ALLOW_INSECURE_HTTP` to `true`. This sends credentials without transport
+encryption. The plugin option must be a JSON boolean; the environment variable
+accepts `true`, `1`, `yes`, or `on` to enable it and `false`, `0`, `no`, or `off`
+to disable it, ignoring case and surrounding whitespace. Invalid values reject
+setup. Unauthenticated HTTP does not require this opt-in.
 
 Use a non-admin ntfy account with this minimum ACL, where
 `replace-with-random-topic` is the configured fixed topic:
@@ -121,7 +134,24 @@ Publishes and dismissals use the configured request timeout and bounded retries 
 
 Retries reuse the same ntfy `sequence_id`, so retries do not create separate notification sequences. This is not an exact-once guarantee: if the server accepted a request but its HTTP response was lost, a retry can send the notification again.
 
-The event subscription reconnects automatically after a failure or end of the stream with bounded backoff. The public OpenCode event stream is live-only, so events emitted while disconnected cannot be replayed. Reconnection resumes live processing; it does not recover or resynchronize missed events.
+Session metadata lookups retry once after a transient network failure, timeout,
+or retryable HTTP status, using `retryDelayMs` between attempts and
+`requestTimeoutMs` for each attempt. Setting `retryAttempts` to 1 disables this
+retry. If the plugin cannot establish that a session is a root session, it skips
+the completion alert.
+
+The event subscription reconnects automatically after a failure or end of the stream with exponential backoff and jitter, capped at 10 seconds. The backoff resets after a connection remains open for 10 seconds, rather than on its first event. The public OpenCode event stream is live-only, so events emitted while disconnected cannot be replayed. Reconnection resumes live processing; it does not recover or resynchronize missed events.
+
+The plugin targets the pinned OpenCode 2.0.4 API and filters subscribed events
+locally. Comparable durable event sequence numbers take precedence over local
+prompt timestamps, so clock skew does not discard a newer execution event.
+
+When the plugin has a location, it checks event locations and falls back to
+cached session locations when an event omits its location. Session metadata
+lookups also check the location before publishing. Moving a session out of the
+plugin's location cancels pending alerts and dismisses existing ones; moving it
+back permits notifications again. Hidden-content request alerts do not perform
+an extra lookup solely to discover an unknown location.
 
 The prompt hook performs remote dismissal in the background so a slow ntfy server does not block OpenCode. Archiving or deleting a session, answering or rejecting a question, and answering a permission request cancel stale notifications. Clean shutdown attempts a bounded, best-effort clearing of notifications created by the process; an abruptly killed process cannot clear them.
 
@@ -133,4 +163,4 @@ The ntfy server URL must be reachable by both the machine running OpenCode and t
 
 Run `npm test` to execute every root `*.test.mjs` file, including transport and runtime coverage. Run `npm run typecheck` to typecheck `index.ts` and its imported modules.
 
-Regression coverage includes request timeouts and abort release, bounded retry and non-retry statuses, `Retry-After` limits, stalled response bodies, duplicate idle coalescing, stale completion invalidation, question and permission dismissal, auto-approval suppression, and shutdown races.
+Regression coverage includes request timeouts and abort release, bounded retry and non-retry statuses, `Retry-After` limits, stalled response bodies, duplicate idle coalescing, stale completion invalidation, question and permission dismissal, auto-approval suppression, shutdown races, clock skew, reconnect backoff, URL and authentication validation, metadata lookup retries, and workspace filtering.

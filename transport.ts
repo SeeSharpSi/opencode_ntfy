@@ -132,9 +132,39 @@ const isRetryableNetworkError = (error: Error): boolean => {
   return false
 }
 
-const isRetryable = (error: unknown) => {
+const errorStatus = (error: unknown): number | undefined => {
+  const seen = new Set<unknown>()
+  let current: unknown = error
+
+  for (let depth = 0; depth < 3; depth++) {
+    if (typeof current !== "object" || current === null) return undefined
+    if (seen.has(current)) return undefined
+    seen.add(current)
+
+    const record = current as {
+      status?: unknown
+      statusCode?: unknown
+      response?: unknown
+      cause?: unknown
+    }
+    if (typeof record.status === "number") return record.status
+    if (typeof record.statusCode === "number") return record.statusCode
+    if (typeof record.response === "object" && record.response !== null) {
+      const status = (record.response as { status?: unknown }).status
+      if (typeof status === "number") return status
+    }
+
+    current = record.cause
+  }
+
+  return undefined
+}
+
+export const isRetryableError = (error: unknown) => {
   if (error instanceof Error && error.name === "AbortError") return false
   if (error instanceof NtfyHttpError) return retryableStatuses.has(error.status)
+  const status = errorStatus(error)
+  if (status !== undefined) return retryableStatuses.has(status)
   if (error instanceof TimeoutError) return true
   if (error instanceof TypeError) return true
   return error instanceof Error && isRetryableNetworkError(error)
@@ -249,7 +279,7 @@ export async function request(
       throwIfAborted(signal)
       lastError = error
 
-      if (attemptIndex + 1 >= attempts || !isRetryable(error)) throw error
+      if (attemptIndex + 1 >= attempts || !isRetryableError(error)) throw error
 
       const baseDelay = Number.isFinite(policy.retryDelayMs)
         ? Math.max(0, policy.retryDelayMs)

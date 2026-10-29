@@ -2,6 +2,8 @@ import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
 import test from "node:test"
 
+import { ClientError } from "@opencode/client"
+
 import { createNtfyRuntime, setupNtfyRuntime } from "./index.ts"
 
 const environmentNames = [
@@ -11,6 +13,7 @@ const environmentNames = [
   "NTFY_TOKEN",
   "NTFY_USERNAME",
   "NTFY_PASSWORD",
+  "NTFY_ALLOW_INSECURE_HTTP",
   "NTFY_HIDE_CHAT_CONTENT",
   "NTFY_REQUEST_TIMEOUT_MS",
   "NTFY_RETRY_ATTEMPTS",
@@ -126,9 +129,9 @@ const makeRuntime = async (overrides = {}) => {
       ...overrides.options,
     },
     session: {
-      get: async (input) => {
+      get: async (input, requestOptions) => {
         lookups.push(input.sessionID)
-        return get(input)
+        return get(input, requestOptions)
       },
     },
   }
@@ -301,6 +304,27 @@ const sessionRenamedEvent = (id, title) => ({
 const sessionDeletedEvent = (id = sessionID) => ({
   type: "session.deleted",
   data: { sessionID: id },
+})
+
+const sessionCreatedAtEvent = (id, directory, title = "Test session") => ({
+  type: "session.created",
+  data: {
+    sessionID: id,
+    projectID: "project-id",
+    slug: id,
+    title,
+    location: { directory },
+  },
+})
+
+const sessionMovedEvent = (id, directory) => ({
+  type: "session.moved",
+  data: { sessionID: id, location: { directory } },
+})
+
+const inDirectory = (event, directory) => ({
+  ...event,
+  location: { directory },
 })
 
 const completionPosts = (mock) =>
@@ -1753,34 +1777,6 @@ test(
 )
 
 test(
-  "plugin subscription requests the native event types it handles",
-  { timeout: 1500 },
-  async () => {
-    const { ctx, subscriptions } = makeSetupContext({
-      subscribe: (_call, requestOptions) =>
-        (async function* () {
-          await waitForAbort(requestOptions.signal)
-        })(),
-    })
-    const cleanup = await setupNtfyRuntime(ctx)
-    try {
-      assert.ok(subscriptions.length >= 1)
-      const types = subscriptions[0].types
-      assert.ok(Array.isArray(types), "subscription types must be an array")
-      for (const type of [
-        "session.execution.succeeded",
-        "form.created",
-        "permission.asked",
-      ]) {
-        assert.ok(types.includes(type), `subscription types must include ${type}`)
-      }
-    } finally {
-      await withDeadline(cleanup(), 750, "plugin cleanup")
-    }
-  },
-)
-
-test(
   "plugin resubscribes after a stream throws AbortError without shutdown",
   { timeout: 2000 },
   async () => {
@@ -2005,6 +2001,932 @@ test(
     } finally {
       await withDeadline(cleanup(), 750, "plugin cleanup")
       silent.restore()
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "durable execution sequences outrank clock-skewed prompt timestamps",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    try {
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.started", sessionID, 1000, 10),
+      )
+      await runtime.handlePrompt(sessionID)
+
+      // The failed execution is newer by durable sequence even though its
+      // server timestamp is behind the local prompt timestamp.
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.failed", sessionID, 1001, 11),
+      )
+      await runtime.handleEvent(idleEvent())
+      assert.equal(completionPosts(mock).length, 0)
+
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.started", sessionID, 1002, 12),
+      )
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.succeeded", sessionID, 1003, 13),
+      )
+      assert.equal(completionPosts(mock).length, 1)
+
+      await runtime.handlePrompt(sessionID)
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.succeeded", sessionID, 1004, 13),
+      )
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.succeeded", sessionID, 1003, 12),
+      )
+      assert.equal(completionPosts(mock).length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "plugin subscription uses only supported RequestOptions and ignores unrelated events",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { ctx, subscriptions } = makeSetupContext({
+      subscribe: (_call, requestOptions) =>
+        (async function* () {
+          yield { type: "server.connected", data: {} }
+          yield { type: "project.updated", data: { projectID: "project-id" } }
+          await waitForAbort(requestOptions.signal)
+        })(),
+    })
+    const cleanup = await setupNtfyRuntime(ctx)
+    try {
+      assert.ok(subscriptions.length >= 1)
+      const requestOptions = subscriptions[0]
+      assert.ok(requestOptions.signal instanceof AbortSignal)
+      assert.equal("types" in requestOptions, false)
+
+      await flushTasks()
+      assert.equal(mock.posts.length, 0)
+      assert.equal(mock.clears.length, 0)
+    } finally {
+      await withDeadline(cleanup(), 750, "plugin cleanup")
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "reconnect backoff grows across short server.connected streams and stays bounded",
+  { timeout: 4000 },
+  async () => {
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    const silent = useSilentConsoleError()
+    const reconnectDelays = []
+    const eighthSubscription = deferred()
+    let subscriptionCalls = 0
+    const { ctx } = makeSetupContext({
+      options: { requestTimeoutMs: 50, retryAttempts: 1 },
+      subscribe: (call, requestOptions) => {
+        subscriptionCalls = Math.max(subscriptionCalls, call)
+        if (call === 8) eighthSubscription.resolve()
+        return (async function* () {
+          if (call <= 7) {
+            // An event is not evidence of a stable connection.
+            yield { type: "server.connected", data: {} }
+            return
+          }
+          await waitForAbort(requestOptions.signal)
+        })()
+      },
+    })
+    const deadlineWithOriginalTimer = (promise, milliseconds, label) =>
+      new Promise((resolve, reject) => {
+        const timer = originalSetTimeout(
+          () => reject(new Error(`${label} did not settle within ${milliseconds}ms`)),
+          milliseconds,
+        )
+        promise.then(
+          (value) => {
+            originalClearTimeout(timer)
+            resolve(value)
+          },
+          (error) => {
+            originalClearTimeout(timer)
+            reject(error)
+          },
+        )
+      })
+
+    let cleanup
+    try {
+      globalThis.setTimeout = (callback, milliseconds, ...args) => {
+        if (typeof milliseconds === "number" && milliseconds >= 200) {
+          reconnectDelays.push(milliseconds)
+          return originalSetTimeout(callback, 0, ...args)
+        }
+        return originalSetTimeout(callback, milliseconds, ...args)
+      }
+      cleanup = await setupNtfyRuntime(ctx)
+      await deadlineWithOriginalTimer(
+        eighthSubscription.promise,
+        3000,
+        "eighth subscription",
+      )
+      assert.equal(subscriptionCalls, 8)
+      assert.ok(
+        reconnectDelays.length >= 7,
+        `expected at least seven reconnect delays, received ${reconnectDelays.length}`,
+      )
+
+      const bases = [250, 500, 1000, 2000, 4000, 8000, 10000]
+      for (let index = 0; index < bases.length; index++) {
+        const base = bases[index]
+        const delay = reconnectDelays[index]
+        assert.ok(delay >= base, `delay ${delay}ms must be at least ${base}ms`)
+        assert.ok(
+          delay <= Math.min(10000, base * 1.2),
+          `delay ${delay}ms exceeds the jittered cap for ${base}ms`,
+        )
+      }
+      assert.ok(
+        reconnectDelays[6] === 10000,
+        "reconnect delay must remain capped at ten seconds including jitter",
+      )
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+      if (cleanup) await withDeadline(cleanup(), 1000, "plugin cleanup")
+      silent.restore()
+    }
+  },
+)
+
+test(
+  "reconnect backoff resets only after a stream stays stable for ten seconds",
+  { timeout: 4000 },
+  async () => {
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    const originalPerformanceNow = performance.now
+    const silent = useSilentConsoleError()
+    const reconnectDelays = []
+    const fourthSubscription = deferred()
+    let clock = originalPerformanceNow.call(performance)
+    let subscriptionCalls = 0
+    const { ctx } = makeSetupContext({
+      options: { requestTimeoutMs: 50, retryAttempts: 1 },
+      subscribe: (call, requestOptions) => {
+        subscriptionCalls = Math.max(subscriptionCalls, call)
+        if (call === 4) fourthSubscription.resolve()
+        return (async function* () {
+          if (call <= 3) {
+            if (call === 3) clock += 10_001
+            yield { type: "server.connected", data: {} }
+            return
+          }
+          await waitForAbort(requestOptions.signal)
+        })()
+      },
+    })
+    const deadlineWithOriginalTimer = (promise, milliseconds, label) =>
+      new Promise((resolve, reject) => {
+        const timer = originalSetTimeout(
+          () => reject(new Error(`${label} did not settle within ${milliseconds}ms`)),
+          milliseconds,
+        )
+        promise.then(
+          (value) => {
+            originalClearTimeout(timer)
+            resolve(value)
+          },
+          (error) => {
+            originalClearTimeout(timer)
+            reject(error)
+          },
+        )
+      })
+
+    let cleanup
+    try {
+      performance.now = () => clock
+      globalThis.setTimeout = (callback, milliseconds, ...args) => {
+        if (typeof milliseconds === "number" && milliseconds >= 200) {
+          reconnectDelays.push(milliseconds)
+          return originalSetTimeout(callback, 0, ...args)
+        }
+        return originalSetTimeout(callback, milliseconds, ...args)
+      }
+      cleanup = await setupNtfyRuntime(ctx)
+      await deadlineWithOriginalTimer(
+        fourthSubscription.promise,
+        3000,
+        "fourth subscription",
+      )
+      assert.equal(subscriptionCalls, 4)
+      assert.ok(reconnectDelays.length >= 3)
+      assert.ok(
+        reconnectDelays[0] >= 250 && reconnectDelays[0] <= 300,
+        `first delay ${reconnectDelays[0]}ms must start at the 250ms floor`,
+      )
+      assert.ok(
+        reconnectDelays[1] >= 500 && reconnectDelays[1] <= 600,
+        `second delay ${reconnectDelays[1]}ms must grow to 500ms`,
+      )
+      assert.ok(
+        reconnectDelays[2] >= 250 && reconnectDelays[2] <= 300,
+        `delay after a stable stream ${reconnectDelays[2]}ms must reset to 250ms`,
+      )
+    } finally {
+      performance.now = originalPerformanceNow
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+      if (cleanup) await withDeadline(cleanup(), 1000, "plugin cleanup")
+      silent.restore()
+    }
+  },
+)
+
+test(
+  "server URL validation rejects unsafe forms without leaking credentials",
+  { timeout: 2000 },
+  async () => {
+    const context = {
+      session: { get: async () => ({ title: "Test session" }) },
+    }
+    const secret = "super-secret-password"
+    const invalidServers = [
+      ["malformed", "not a url"],
+      ["non-http", "ftp://ntfy.example.com"],
+      ["embedded credentials", `https://user:${secret}@ntfy.example.com`],
+      ["query string", `https://ntfy.example.com/?token=${secret}`],
+      ["fragment", `https://ntfy.example.com/#${secret}`],
+    ]
+
+    for (const [label, server] of invalidServers) {
+      await assert.rejects(
+        createNtfyRuntime({
+          ...context,
+          options: { ...baseOptions, server, token: "test-token" },
+        }),
+        (error) => {
+          assert.match(error.message, /server|url/i)
+          assert.doesNotMatch(error.message, new RegExp(secret))
+          return true
+        },
+        `${label} server URL must reject without leaking the secret`,
+      )
+    }
+  },
+)
+
+test(
+  "insecure HTTP credentials require an explicit boolean opt-in",
+  { timeout: 3000 },
+  async () => {
+    const context = {
+      session: { get: async () => ({ title: "Test session" }) },
+    }
+    const httpServer = "http://127.0.0.1:8081"
+    const httpsServer = "https://ntfy.example.com"
+    const authSettings = [
+      { token: "test-token" },
+      { username: "test-user", password: "test-password" },
+    ]
+
+    for (const auth of authSettings) {
+      await assert.rejects(
+        createNtfyRuntime({
+          ...context,
+          options: { ...baseOptions, server: httpServer, ...auth },
+        }),
+        /allowInsecureHttp|insecure HTTP|HTTPS/i,
+      )
+    }
+
+    let runtime
+    try {
+      runtime = await createNtfyRuntime({
+        ...context,
+        options: { ...baseOptions, server: httpServer },
+      })
+      await runtime.dispose()
+      runtime = undefined
+
+      runtime = await createNtfyRuntime({
+        ...context,
+        options: { ...baseOptions, server: httpsServer, token: "test-token" },
+      })
+      await runtime.dispose()
+      runtime = undefined
+
+      runtime = await createNtfyRuntime({
+        ...context,
+        options: {
+          ...baseOptions,
+          server: httpServer,
+          token: "test-token",
+          allowInsecureHttp: true,
+        },
+      })
+      await runtime.dispose()
+      runtime = undefined
+
+      process.env.NTFY_ALLOW_INSECURE_HTTP = "true"
+      runtime = await createNtfyRuntime({
+        ...context,
+        options: { ...baseOptions, server: httpServer, token: "test-token" },
+      })
+      await runtime.dispose()
+      runtime = undefined
+
+      await assert.rejects(
+        createNtfyRuntime({
+          ...context,
+          options: {
+            ...baseOptions,
+            server: httpServer,
+            token: "test-token",
+            allowInsecureHttp: false,
+          },
+        }),
+        /allowInsecureHttp|insecure HTTP|HTTPS/i,
+        "an explicit false option must override an enabled environment variable",
+      )
+    } finally {
+      delete process.env.NTFY_ALLOW_INSECURE_HTTP
+      if (runtime) await runtime.dispose()
+    }
+  },
+)
+
+test(
+  "invalid allowInsecureHttp settings reject setup",
+  { timeout: 2000 },
+  async () => {
+    const context = {
+      session: { get: async () => ({ title: "Test session" }) },
+    }
+    for (const value of ["true", 1, "not-a-boolean"]) {
+      await assert.rejects(
+        createNtfyRuntime({
+          ...context,
+          options: {
+            ...baseOptions,
+            server: "https://ntfy.example.com",
+            allowInsecureHttp: value,
+          },
+        }),
+        /allowInsecureHttp/i,
+        `allowInsecureHttp option ${JSON.stringify(value)} must reject`,
+      )
+    }
+
+    process.env.NTFY_ALLOW_INSECURE_HTTP = "sometimes"
+    try {
+      await assert.rejects(
+        createNtfyRuntime({
+          ...context,
+          options: { ...baseOptions, server: "https://ntfy.example.com" },
+        }),
+        /allowInsecureHttp/i,
+        "an invalid environment boolean must reject",
+      )
+    } finally {
+      delete process.env.NTFY_ALLOW_INSECURE_HTTP
+    }
+  },
+)
+
+test(
+  "publish and dismissal requests reject redirects",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    try {
+      await runtime.handleEvent(idleEvent())
+      assert.equal(mock.posts.length, 1)
+      assert.equal(mock.posts[0].init.redirect, "error")
+
+      await runtime.handlePrompt(sessionID)
+      assert.equal(mock.clears.length, 1)
+      assert.equal(mock.clears[0].init.redirect, "error")
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+const transientLookupError = (label) => {
+  if (label === "network") return new TypeError("fetch failed")
+  return new ClientError("UnexpectedStatus", { cause: { status: 503 } })
+}
+
+test(
+  "metadata lookups retry once after transient network and status failures",
+  { timeout: 3000 },
+  async () => {
+    for (const label of ["network", "status"]) {
+      const mock = createMock()
+      const restoreFetch = useFetch(mock.fetch)
+      const silent = useSilentConsoleError()
+      let attempts = 0
+      const { runtime, lookups } = await makeRuntime({
+        options: {
+          hideChatContent: false,
+          requestTimeoutMs: 200,
+          retryAttempts: 5,
+          retryDelayMs: 5,
+        },
+        get: async () => {
+          attempts++
+          if (attempts === 1) throw transientLookupError(label)
+          return { title: "Test session" }
+        },
+      })
+      try {
+        await withDeadline(
+          runtime.handleEvent(executionSucceededEvent()),
+          1000,
+          `${label} lookup retry completion`,
+        )
+        assert.equal(lookups.length, 2)
+        assert.equal(completionPosts(mock).length, 1)
+      } finally {
+        await disposeQuietly(runtime)
+        silent.restore()
+        restoreFetch()
+      }
+    }
+  },
+)
+
+test(
+  "metadata lookup retries are bounded to two attempts",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const silent = useSilentConsoleError()
+    let attempts = 0
+    const { runtime, lookups } = await makeRuntime({
+      options: {
+        hideChatContent: false,
+        requestTimeoutMs: 200,
+        retryAttempts: 5,
+        retryDelayMs: 5,
+      },
+      get: async () => {
+        attempts++
+        throw new TypeError("fetch failed")
+      },
+    })
+    try {
+      await withDeadline(
+        runtime.handleEvent(executionSucceededEvent()),
+        1000,
+        "bounded lookup retries",
+      )
+      assert.equal(lookups.length, 2)
+      assert.equal(attempts, 2)
+      assert.equal(completionPosts(mock).length, 0)
+    } finally {
+      await disposeQuietly(runtime)
+      silent.restore()
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "metadata lookups do not retry permanent or programming failures",
+  { timeout: 2500 },
+  async () => {
+    const cases = [
+      [
+        "forbidden status",
+        { retryAttempts: 3 },
+        () => {
+          const error = new ClientError("UnexpectedStatus", {
+            cause: { status: 403 },
+          })
+          error.message = "fetch failed"
+          return error
+        },
+      ],
+      ["retry disabled", { retryAttempts: 1 }, () => new TypeError("fetch failed")],
+      ["programming error", { retryAttempts: 3 }, () => new Error("unexpected lookup failure")],
+    ]
+    for (const [label, optionOverrides, makeError] of cases) {
+      const mock = createMock()
+      const restoreFetch = useFetch(mock.fetch)
+      const silent = useSilentConsoleError()
+      let attempts = 0
+      const { runtime, lookups } = await makeRuntime({
+        options: {
+          hideChatContent: false,
+          requestTimeoutMs: 200,
+          retryDelayMs: 5,
+          ...optionOverrides,
+        },
+        get: async () => {
+          attempts++
+          throw makeError()
+        },
+      })
+      try {
+        await withDeadline(
+          runtime.handleEvent(executionSucceededEvent()),
+          1000,
+          `${label} lookup`,
+        )
+        assert.equal(lookups.length, 1, `${label} must not retry`)
+        assert.equal(attempts, 1)
+        assert.equal(completionPosts(mock).length, 0)
+      } finally {
+        await disposeQuietly(runtime)
+        silent.restore()
+        restoreFetch()
+      }
+    }
+  },
+)
+
+test(
+  "metadata lookup timeout retries and aborts the previous lookup",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const silent = useSilentConsoleError()
+    const signals = []
+    let attempts = 0
+    const { runtime, lookups } = await makeRuntime({
+      options: {
+        hideChatContent: false,
+        requestTimeoutMs: 40,
+        retryAttempts: 2,
+        retryDelayMs: 5,
+      },
+      get: (input, requestOptions) => {
+        attempts++
+        const signal = requestOptions?.signal
+        signals.push(signal)
+        if (attempts === 1) {
+          return new Promise((_resolve, reject) => {
+            const fail = () =>
+              reject(
+                signal?.reason instanceof Error
+                  ? signal.reason
+                  : new DOMException("operation aborted", "AbortError"),
+              )
+            if (!signal || signal.aborted) {
+              fail()
+              return
+            }
+            signal.addEventListener("abort", fail, { once: true })
+          })
+        }
+        return { title: "Test session" }
+      },
+    })
+    try {
+      await withDeadline(
+        runtime.handleEvent(executionSucceededEvent()),
+        1500,
+        "timeout lookup retry completion",
+      )
+      assert.equal(lookups.length, 2)
+      assert.equal(signals.length, 2)
+      assert.equal(signals[0].aborted, true)
+      assert.equal(completionPosts(mock).length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      silent.restore()
+      restoreFetch()
+    }
+  },
+)
+
+for (const [name, cancel] of [
+  ["prompt", (runtime) => runtime.handlePrompt(sessionID)],
+  ["dispose", (runtime) => runtime.dispose()],
+]) {
+  test(
+    `a new ${name} cancels metadata lookup retry backoff`,
+    { timeout: 2000 },
+    async () => {
+      const mock = createMock()
+      const restoreFetch = useFetch(mock.fetch)
+      const silent = useSilentConsoleError()
+      const firstLookup = deferred()
+      let attempts = 0
+      const { runtime, lookups } = await makeRuntime({
+        options: {
+          hideChatContent: false,
+          requestTimeoutMs: 200,
+          retryAttempts: 2,
+          retryDelayMs: 80,
+        },
+        get: async () => {
+          attempts++
+          if (attempts === 1) {
+            firstLookup.resolve()
+            throw new TypeError("fetch failed")
+          }
+          return { title: "Test session" }
+        },
+      })
+      try {
+        const completion = runtime.handleEvent(executionSucceededEvent())
+        await withDeadline(firstLookup.promise, 300, "first lookup")
+        await withDeadline(cancel(runtime), 300, name)
+        await withDeadline(completion, 500, `${name} cancellation`)
+        await delay(150)
+
+        assert.equal(lookups.length, 1)
+        assert.equal(attempts, 1)
+        assert.equal(completionPosts(mock).length, 0)
+      } finally {
+        await disposeQuietly(runtime)
+        silent.restore()
+        restoreFetch()
+      }
+    },
+  )
+}
+
+test(
+  "cached session locations suppress location-less events from other directories",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime, lookups } = await makeRuntime({
+      location: { directory: "/tmp/opencode-ntfy-runtime" },
+    })
+    try {
+      await runtime.handleEvent(
+        sessionCreatedAtEvent(
+          "cached-other-session",
+          "/tmp/another-project",
+          "Other title",
+        ),
+      )
+      await runtime.handleEvent(idleEvent("cached-other-session"))
+      await runtime.handleEvent(
+        questionEvent("cached-other-question", "cached-other-session"),
+      )
+      await runtime.handleEvent(
+        permissionEvent("cached-other-permission", "cached-other-session"),
+      )
+
+      assert.equal(mock.posts.length, 0)
+      assert.equal(lookups.length, 0)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "session metadata outside the workspace suppresses completions and titled requests",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime, lookups } = await makeRuntime({
+      location: { directory: "/tmp/opencode-ntfy-runtime" },
+      options: { hideChatContent: false, permissionDelayMs: 10 },
+      get: async () => ({
+        title: "Other location session",
+        location: { directory: "/tmp/another-project" },
+      }),
+    })
+    try {
+      await runtime.handleEvent(idleEvent("metadata-other-completion"))
+      await runtime.handleEvent(
+        questionEvent("metadata-other-question", "metadata-other-question-session"),
+      )
+      await runtime.handleEvent(
+        permissionEvent(
+          "metadata-other-permission",
+          "metadata-other-permission-session",
+        ),
+      )
+
+      assert.equal(mock.posts.length, 0)
+      assert.ok(
+        lookups.length >= 1,
+        "title-enabled requests must look up metadata before publishing",
+      )
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "moving a session out cancels alerts, suppresses events, and moving back restores them",
+  { timeout: 2500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const currentDirectory = "/tmp/opencode-ntfy-runtime"
+    const otherDirectory = "/tmp/another-project"
+    const pendingLookupStarted = deferred()
+    const pendingLookupRelease = deferred()
+    const { runtime } = await makeRuntime({
+      location: { directory: currentDirectory },
+      options: { hideChatContent: false, permissionDelayMs: 0 },
+      get: async ({ sessionID: id }) => {
+        if (id === "pending-move-session") {
+          pendingLookupStarted.resolve()
+          return pendingLookupRelease.promise
+        }
+        return { title: "Test session" }
+      },
+    })
+    try {
+      await runtime.handleEvent(
+        sessionCreatedAtEvent("moved-session", currentDirectory, "Moved title"),
+      )
+      await runtime.handleEvent(idleEvent("moved-session"))
+      assert.equal(
+        postsFor(mock, "opencode-moved-session").length,
+        1,
+      )
+
+      await runtime.handleEvent(sessionMovedEvent("moved-session", otherDirectory))
+      assert.ok(
+        mock.clears.some((request) =>
+          request.url.includes("/opencode-moved-session/clear"),
+        ),
+        "moving a session out must dismiss its completion notification",
+      )
+
+      await runtime.handleEvent(idleEvent("moved-session"))
+      await runtime.handleEvent(
+        questionEvent("moved-out-question", "moved-session"),
+      )
+      await runtime.handleEvent(
+        permissionEvent("moved-out-permission", "moved-session"),
+      )
+      assert.equal(postsFor(mock, "opencode-question-moved-out-question").length, 0)
+      assert.equal(postsFor(mock, "opencode-permission-moved-out-permission").length, 0)
+      assert.equal(postsFor(mock, "opencode-moved-session").length, 1)
+
+      const pendingCompletion = runtime.handleEvent(idleEvent("pending-move-session"))
+      await withDeadline(
+        pendingLookupStarted.promise,
+        300,
+        "pending completion lookup",
+      )
+      await runtime.handleEvent(
+        sessionMovedEvent("pending-move-session", otherDirectory),
+      )
+      pendingLookupRelease.resolve({ title: "Pending title" })
+      await withDeadline(
+        pendingCompletion,
+        500,
+        "cancelled pending completion",
+      )
+      assert.equal(postsFor(mock, "opencode-pending-move-session").length, 0)
+
+      await runtime.handleEvent(sessionMovedEvent("moved-session", currentDirectory))
+      await runtime.handleEvent(executionStartedEvent("moved-session"))
+      await runtime.handleEvent(executionSucceededEvent("moved-session"))
+      assert.equal(postsFor(mock, "opencode-moved-session").length, 2)
+    } finally {
+      pendingLookupRelease.resolve({ title: "Pending title" })
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "reply events still dismiss known alerts when their envelope is outside the workspace",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const currentDirectory = "/tmp/opencode-ntfy-runtime"
+    const otherDirectory = "/tmp/another-project"
+    const { runtime } = await makeRuntime({
+      location: { directory: currentDirectory },
+      options: { hideChatContent: false, permissionDelayMs: 0 },
+    })
+    try {
+      await runtime.handleEvent(
+        inDirectory(
+          questionEvent("outside-reply-question", "outside-reply-session"),
+          currentDirectory,
+        ),
+      )
+      await runtime.handleEvent(
+        inDirectory(
+          permissionEvent("outside-reply-permission", "outside-reply-session"),
+          currentDirectory,
+        ),
+      )
+      assert.equal(
+        postsFor(mock, "opencode-question-outside-reply-question").length,
+        1,
+      )
+      assert.equal(
+        postsFor(mock, "opencode-permission-outside-reply-permission").length,
+        1,
+      )
+
+      await runtime.handleEvent(
+        inDirectory(
+          questionRepliedEvent("outside-reply-question", "outside-reply-session"),
+          otherDirectory,
+        ),
+      )
+      await runtime.handleEvent(
+        inDirectory(
+          permissionRepliedEvent("outside-reply-permission", "outside-reply-session"),
+          otherDirectory,
+        ),
+      )
+
+      const cleared = mock.clears.map((request) => request.url)
+      assert.ok(
+        cleared.includes(
+          "https://ntfy.example.com/test-topic/opencode-question-outside-reply-question/clear",
+        ),
+      )
+      assert.ok(
+        cleared.includes(
+          "https://ntfy.example.com/test-topic/opencode-permission-outside-reply-permission/clear",
+        ),
+      )
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "hidden request titles keep the zero-lookup fast path with a known location",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime, lookups } = await makeRuntime({
+      location: { directory: "/tmp/opencode-ntfy-runtime" },
+      get: async () => {
+        throw new Error("hidden request titles must not be looked up")
+      },
+      options: { permissionDelayMs: 10 },
+    })
+    try {
+      await runtime.handleEvent(
+        sessionCreatedAtEvent(
+          "hidden-location-session",
+          "/tmp/opencode-ntfy-runtime",
+        ),
+      )
+      await runtime.handleEvent(
+        questionEvent("hidden-location-question", "hidden-location-session"),
+      )
+      await runtime.handleEvent(
+        permissionEvent("hidden-location-permission", "hidden-location-session"),
+      )
+
+      assert.equal(lookups.length, 0)
+      assert.equal(
+        postsFor(mock, "opencode-question-hidden-location-question").length,
+        1,
+      )
+      assert.equal(
+        postsFor(mock, "opencode-permission-hidden-location-permission").length,
+        1,
+      )
+      assert.equal(
+        postsFor(mock, "opencode-question-hidden-location-question")[0].body.title,
+        "OpenCode",
+      )
+      assert.equal(
+        postsFor(mock, "opencode-permission-hidden-location-permission")[0].body.title,
+        "OpenCode",
+      )
+    } finally {
+      await disposeQuietly(runtime)
       restoreFetch()
     }
   },

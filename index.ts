@@ -1,40 +1,22 @@
 import { Plugin } from "@opencode/plugin"
 import type { OpenCodeEvent } from "@opencode/client"
 import {
+  isRetryableError,
   request as sendRequest,
   wait,
+  TimeoutError,
   type DeliveryPolicy,
 } from "./transport.js"
 
 type NtfyContext = {
-  readonly options?: Readonly<Record<string, unknown>>
-  readonly location?: {
-    readonly directory?: string
-  }
-  readonly session: {
-    get(input: { sessionID: string }, options?: { signal?: AbortSignal }): Promise<unknown>
-  }
-}
-
-type NtfySubscriptionOptions = {
-  readonly signal?: AbortSignal
-  readonly types?: readonly string[]
+  readonly options?: Plugin.Context["options"]
+  readonly location?: Pick<Plugin.Context["location"], "directory">
+  readonly session: Pick<Plugin.Context["session"], "get">
 }
 
 type NtfySetupContext = NtfyContext & {
-  readonly event: {
-    subscribe(options?: NtfySubscriptionOptions): AsyncIterable<OpenCodeEvent>
-  }
-  readonly session: NtfyContext["session"] & {
-    hook(
-      name: "prompt",
-      callback: (event: { sessionID: string }) => Promise<void> | void,
-    ): Promise<Registration | void> | Registration | void
-  }
-}
-
-type Registration = {
-  dispose(): Promise<void> | void
+  readonly event: Pick<Plugin.Context["event"], "subscribe">
+  readonly session: Pick<Plugin.Context["session"], "get" | "hook">
 }
 
 type ForwardCompatibleSessionEvent = {
@@ -126,7 +108,17 @@ const relevantEventTypes = new Set([
   "permission.asked",
   "permission.replied",
 ])
-const relevantEventTypeList = [...relevantEventTypes]
+const notificationClearingEventTypes = new Set([
+  "session.created",
+  "session.renamed",
+  "session.moved",
+  "session.deleted",
+  "session.archived",
+  "session.unarchived",
+  "form.replied",
+  "form.cancelled",
+  "permission.replied",
+])
 
 const oneLine = (value: unknown, limit = 120) =>
   String(value).replace(/\s+/g, " ").trim().slice(0, limit)
@@ -196,6 +188,51 @@ const readIntegerSetting = (
   return fallback
 }
 
+const readBooleanSetting = (
+  options: Readonly<Record<string, unknown>> | undefined,
+  environment: Readonly<Record<string, string | undefined>> | undefined,
+  optionName: string,
+  environmentName: string,
+  fallback: boolean,
+) => {
+  const optionValue = options?.[optionName]
+  if (optionValue !== undefined) {
+    if (typeof optionValue !== "boolean") {
+      throw new Error(`opencode-ntfy option ${optionName} must be a boolean`)
+    }
+    return optionValue
+  }
+  const environmentValue = environment?.[environmentName]
+  if (environmentValue !== undefined) {
+    const normalized = environmentValue.trim().toLowerCase()
+    if (["true", "1", "yes", "on"].includes(normalized)) return true
+    if (["false", "0", "no", "off"].includes(normalized)) return false
+    throw new Error(
+      `opencode-ntfy environment variable ${environmentName} for ${optionName} must be true or false`,
+    )
+  }
+  return fallback
+}
+
+const parseServerUrl = (value: string) => {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error("opencode-ntfy server URL must be a valid absolute URL")
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("opencode-ntfy server URL must use http or https")
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error("opencode-ntfy server URL must not include username or password")
+  }
+  if (url.search !== "" || url.hash !== "") {
+    throw new Error("opencode-ntfy server URL must not include a query or fragment")
+  }
+  return { url, base: `${url.origin}${url.pathname}`.replace(/\/+$/, "") }
+}
+
 const normalizeSessionInfo = (value: unknown): Readonly<Record<string, unknown>> | undefined => {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Readonly<Record<string, unknown>>
@@ -222,6 +259,17 @@ const eventWatermark = (event: NotificationEvent): EventWatermark => {
     aggregateID: typeof durable.aggregateID === "string" ? durable.aggregateID : undefined,
     seq: typeof durable.seq === "number" ? durable.seq : undefined,
   }
+}
+
+const sessionIDFromEvent = (event: NotificationEvent) => {
+  const data = event.data as Readonly<Record<string, unknown>> | undefined
+  if (typeof data?.sessionID === "string") return data.sessionID
+  const form = data?.form
+  if (typeof form === "object" && form !== null) {
+    const sessionID = (form as Readonly<Record<string, unknown>>).sessionID
+    if (typeof sessionID === "string") return sessionID
+  }
+  return undefined
 }
 
 export async function createNtfyRuntime(ctx: NtfyContext) {
@@ -291,14 +339,22 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
     5,
     4,
   )
+  const allowInsecureHttp = readBooleanSetting(
+    options,
+    environment,
+    "allowInsecureHttp",
+    "NTFY_ALLOW_INSECURE_HTTP",
+    false,
+  )
 
-  const baseUrl = (
+  const server = parseServerUrl(
     pluginOption("server") ??
-    pluginOption("url") ??
-    environmentVariable("NTFY_SERVER") ??
-    environmentVariable("NTFY_URL") ??
-    "https://ntfy.sh"
-  ).replace(/\/+$/, "")
+      pluginOption("url") ??
+      environmentVariable("NTFY_SERVER") ??
+      environmentVariable("NTFY_URL") ??
+      "https://ntfy.sh",
+  )
+  const baseUrl = server.base
   const optionToken = pluginOption("token")
   const optionUsername = pluginOption("username")
   const optionPassword = pluginOption("password")
@@ -329,6 +385,11 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   const authHeaders: Record<string, string> = authorization
     ? { Authorization: authorization }
     : {}
+  if (authorization !== undefined && server.url.protocol === "http:" && !allowInsecureHttp) {
+    throw new Error(
+      "opencode-ntfy refuses to send credentials over http; set allowInsecureHttp or NTFY_ALLOW_INSECURE_HTTP to allow it",
+    )
+  }
 
   const locationDirectory =
     typeof ctx.location?.directory === "string" ? ctx.location.directory : undefined
@@ -469,6 +530,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
           body: JSON.stringify({ topic, ...message, sequence_id: token.sequenceID }),
+          redirect: "error",
         },
         "ntfy publish",
         policy,
@@ -492,7 +554,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       try {
         await sendRequest(
           topicUrl(topic, `/${encodeURIComponent(sequenceID)}/clear`),
-          { method: "PUT", headers: authHeaders },
+          { method: "PUT", headers: authHeaders, redirect: "error" },
           "ntfy notification clear",
           shutdown ? shutdownPolicy : policy,
           controller.signal,
@@ -515,7 +577,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   const dismissCompletion = (sessionID: string, force = false) =>
     clearSequence(completionSequenceID(sessionID), { force })
 
-  const getSessionBounded = async (
+  const getSessionBoundedOnce = async (
     sessionID: string,
     signal: AbortSignal,
     action: string,
@@ -554,12 +616,13 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       signal.addEventListener("abort", onAbort, { once: true })
       timer = setTimeout(() => {
         controller.abort()
-        fail(new Error(`${action} failed: session lookup timed out after ${policy.requestTimeoutMs}ms`))
+        fail(new TimeoutError(action, policy.requestTimeoutMs))
       }, policy.requestTimeoutMs)
     })
 
     try {
       const lookup = Promise.resolve(ctx.session.get({ sessionID }, { signal: controller.signal }))
+      void lookup.catch(() => {})
       const response = await Promise.race([lookup, stop])
       return normalizeSessionInfo(response)
     } finally {
@@ -567,6 +630,32 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       cleanup()
       controller.abort()
     }
+  }
+
+  const sessionLookupAttempts = Math.min(2, Math.max(1, Math.floor(policy.retryAttempts)))
+  const getSessionBounded = async (
+    sessionID: string,
+    signal: AbortSignal,
+    action: string,
+  ): Promise<Readonly<Record<string, unknown>> | undefined> => {
+    let lastError: unknown
+    for (let attemptIndex = 0; attemptIndex < sessionLookupAttempts; attemptIndex++) {
+      if (signal.aborted) throw abortError()
+      try {
+        return await getSessionBoundedOnce(sessionID, signal, action)
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) throw error
+        lastError = error
+        if (
+          attemptIndex + 1 >= sessionLookupAttempts ||
+          !isRetryableError(error)
+        ) {
+          throw error
+        }
+        await wait(policy.retryDelayMs, signal)
+      }
+    }
+    throw lastError
   }
 
   const mergeSessionInfo = (
@@ -590,6 +679,11 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
     }
     return state
   }
+
+  const isOutsideWorkspace = (directory: string | undefined) =>
+    locationDirectory !== undefined &&
+    directory !== undefined &&
+    directory !== locationDirectory
 
   const resolveRequestTitle = async (
     sessionID: string,
@@ -622,6 +716,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
         }
       }
     }
+    if (isOutsideWorkspace(state.location)) return undefined
     // An unknown parent is not safe to treat as a root session.
     if (!state.parentKnown || state.parentID !== undefined) return undefined
     if (state.archived) return undefined
@@ -693,7 +788,13 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       return Promise.resolve()
     }
     const state = ensureSessionState(sessionID)
-    if (state.archived || state.completionBlocked) return Promise.resolve()
+    if (
+      state.archived ||
+      state.completionBlocked ||
+      isOutsideWorkspace(state.location)
+    ) {
+      return Promise.resolve()
+    }
     state.running = false
     if (state.deliveredGeneration === state.generation) return Promise.resolve()
     if (state.completion?.generation === state.generation) {
@@ -715,6 +816,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       !inactiveSessions.has(sessionID) &&
       !state.archived &&
       !state.completionBlocked &&
+      !isOutsideWorkspace(state.location) &&
       state.generation === generation &&
       state.completion === attempt
 
@@ -765,6 +867,7 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       !disposed &&
       !token.cancelled &&
       !inactiveSessions.has(entry.sessionID) &&
+      !isOutsideWorkspace(sessionStates.get(entry.sessionID)?.location) &&
       entries.get(entry.id) === entry &&
       entry.token === token
     try {
@@ -801,7 +904,8 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
     if (
       disposed ||
       inactiveSessions.has(sessionID) ||
-      sessionStates.get(sessionID)?.archived
+      sessionStates.get(sessionID)?.archived ||
+      isOutsideWorkspace(sessionStates.get(sessionID)?.location)
     ) {
       return Promise.resolve()
     }
@@ -872,6 +976,19 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
     if (releaseMetadata) sessionStates.delete(sessionID)
   }
 
+  // Moving away is not archival: keep the session usable if it moves back.
+  const suspendSession = async (sessionID: string) => {
+    const state = ensureSessionState(sessionID)
+    state.generation++
+    state.running = true
+    state.deliveredGeneration = undefined
+    cancelCompletionAttempt(state)
+    await Promise.all([
+      dismissSessionRequests(sessionID),
+      dismissCompletion(sessionID),
+    ])
+  }
+
   const handleSessionCreated = (data: Readonly<Record<string, unknown>> | undefined) => {
     if (typeof data?.sessionID !== "string") return
     inactiveSessions.delete(data.sessionID)
@@ -890,8 +1007,9 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
       watermark.seq !== undefined &&
       previous.seq !== undefined
     if (comparableSequence) {
-      if (watermark.seq! <= previous!.seq!) return true
-    } else if (
+      return watermark.seq! <= previous!.seq!
+    }
+    if (
       watermark.created !== undefined &&
       previous?.created !== undefined &&
       watermark.created < previous.created
@@ -925,10 +1043,17 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
     const event = incoming
     if (!relevantEventTypes.has(event.type)) return
     const eventDirectory = event.location?.directory
+    const eventSessionID = sessionIDFromEvent(event)
+    const effectiveDirectory =
+      typeof eventDirectory === "string"
+        ? eventDirectory
+        : eventSessionID === undefined
+          ? undefined
+          : sessionStates.get(eventSessionID)?.location
+    // Cleanup events must still clear alerts even when their metadata is elsewhere.
     if (
-      locationDirectory !== undefined &&
-      typeof eventDirectory === "string" &&
-      eventDirectory !== locationDirectory
+      isOutsideWorkspace(effectiveDirectory) &&
+      !notificationClearingEventTypes.has(event.type)
     ) {
       return
     }
@@ -944,7 +1069,10 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
           break
         }
         case "session.moved": {
-          ensureSessionState(event.data.sessionID).location = event.data.location.directory
+          const sessionID = event.data.sessionID
+          const state = ensureSessionState(sessionID)
+          state.location = event.data.location.directory
+          if (isOutsideWorkspace(state.location)) await suspendSession(sessionID)
           break
         }
         case "session.deleted": {
@@ -1091,8 +1219,17 @@ export async function createNtfyRuntime(ctx: NtfyContext) {
   }
 }
 
-const subscriptionDelay = (attempt: number) =>
-  Math.min(10_000, 250 * 2 ** Math.min(attempt, 16))
+const maximumReconnectDelayMs = 10_000
+const stableConnectionMs = 10_000
+
+const subscriptionDelay = (attempt: number) => {
+  const exponential = Math.min(
+    maximumReconnectDelayMs,
+    250 * 2 ** Math.min(attempt, 16),
+  )
+  const jitter = exponential * 0.2 * Math.random()
+  return Math.min(maximumReconnectDelayMs, exponential + jitter)
+}
 
 const subscriptionErrorMessage = (error: unknown) =>
   oneLine(error instanceof Error ? error.message : error, maximumFailureLength)
@@ -1103,6 +1240,8 @@ export async function setupNtfyRuntime(ctx: NtfySetupContext) {
   const tasks = new Set<Promise<void>>()
   let reconnectAttempt = 0
   let subscriptionFailures = 0
+  let streamStartedAt = 0
+  let streamEstablished = false
 
   const track = (promise: Promise<void>) => {
     tasks.add(promise)
@@ -1121,19 +1260,28 @@ export async function setupNtfyRuntime(ctx: NtfySetupContext) {
     console.error(`[opencode-ntfy] ${oneLine(message, maximumFailureLength)}`)
   }
 
+  const establishStreamIfStable = () => {
+    if (streamEstablished) return
+    if (performance.now() - streamStartedAt < stableConnectionMs) return
+    streamEstablished = true
+    reconnectAttempt = 0
+    if (subscriptionFailures > 0) {
+      logFailure("event subscription recovered")
+      subscriptionFailures = 0
+    }
+  }
+
   const consume = async () => {
     while (!controller.signal.aborted) {
+      streamStartedAt = performance.now()
+      streamEstablished = false
       try {
         for await (const event of ctx.event.subscribe({
           signal: controller.signal,
-          types: relevantEventTypeList,
+          onActivity: establishStreamIfStable,
         })) {
           if (controller.signal.aborted) break
-          if (subscriptionFailures > 0) {
-            logFailure("event subscription recovered")
-            subscriptionFailures = 0
-            reconnectAttempt = 0
-          }
+          establishStreamIfStable()
           if (!relevantEventTypes.has(event.type)) continue
           track(
             (async () => {
@@ -1143,11 +1291,14 @@ export async function setupNtfyRuntime(ctx: NtfySetupContext) {
         }
       } catch (error) {
         if (controller.signal.aborted) break
+        establishStreamIfStable()
         subscriptionFailures++
         logFailure(`event subscription failed: ${subscriptionErrorMessage(error)}`)
       }
 
       if (controller.signal.aborted) break
+      // A stream that stayed healthy long enough resets backoff even if it was idle.
+      establishStreamIfStable()
 
       // The stream ended without an explicit shutdown; reconnect with bounded backoff.
       if (subscriptionFailures === 0) {
