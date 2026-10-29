@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 index.ts"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.4"
+    "@opencode/client": "2.2.1",
+    "@opencode/plugin": "2.2.1"
   },
   "devDependencies": {
     "tsx": "^4.20.6",

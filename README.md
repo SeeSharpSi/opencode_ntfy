@@ -1,5 +1,8 @@
 # OpenCode ntfy plugin
 
+Requires **OpenCode 2.2.1 or newer**, including the background service. Older
+versions are rejected before the plugin registers any hooks.
+
 A small local OpenCode plugin that:
 
 - publishes a notification when a root session becomes idle;
@@ -77,9 +80,19 @@ If you later choose to enable the plugin, reference this file from OpenCode's na
 }
 ```
 
-Run `npm install` in the plugin directory before loading it. This installs the
-V2 plugin API and the development tools used by the test suite. Restart the
-OpenCode service after updating the plugin or its configuration:
+Use OpenCode 2.2.1 or newer. Run `npm install` in the plugin directory before
+loading it. This installs the pinned V2 plugin API and the development tools
+used by the test suite. Unsupported hosts are rejected before hooks are
+registered. Updating this package does not update the OpenCode CLI
+or its background service. Check that the executable on your `PATH` reports
+2.2.1 or newer, especially if you have multiple OpenCode installations:
+
+```sh
+opencode --version
+```
+
+Restart the OpenCode service after upgrading OpenCode or updating the plugin
+or its configuration:
 
 ```sh
 opencode service restart
@@ -124,11 +137,11 @@ Subscribe to the fixed topic in the ntfy Android app with an account allowed to 
 
 Question notifications only report that OpenCode has a question. They do not show the question, list options, or support answering through ntfy. Answer questions in OpenCode.
 
-Notification dismissal requires ntfy server 2.16.0 and ntfy Android 1.22.2 or newer. Completion notifications are dismissed when the session receives another prompt, is archived, or is deleted. Permission notifications wait briefly for an automatic answer and are not published when OpenCode auto-approves them. Published permission notifications are dismissed when answered or when their session is archived or deleted. They alert you to return to OpenCode and do not include remote approval actions. Question notifications are dismissed when answered or rejected, or when their session is archived or deleted. Closing a session tab in the Web/Desktop UI cannot dismiss notifications: tab state is client-local and OpenCode emits no plugin event for it. Quitting OpenCode dismisses all notifications created by that process when plugin shutdown completes; an abrupt process kill cannot.
+Notification dismissal requires ntfy server 2.16.0 and ntfy Android 1.22.2 or newer. Completion notifications are dismissed when the session receives another prompt, is archived, or is deleted. Permission notifications wait briefly for an automatic answer, then check whether the request is still pending before publishing. Published permission notifications are dismissed when answered or when their session is archived or deleted. They alert you to return to OpenCode and do not include remote approval actions. Question notifications are dismissed when answered or rejected, or when their session is archived or deleted. Closing a session tab in the Web/Desktop UI cannot dismiss notifications: tab state is client-local and OpenCode emits no plugin event for it. Unloading the plugin or stopping the OpenCode service attempts to dismiss outstanding notifications. An abrupt process kill cannot clear them immediately; a later plugin startup retries stored dismissals.
 
 ### Delivery behavior
 
-Completion alerts are driven primarily by the native `session.execution.succeeded` event. Idle events, including `session.idle` and status-idle fallbacks, are also observed and coalesced per activity cycle, so duplicate success or idle signals publish at most one completion notification until new activity begins another cycle. Execution failed or interrupted events do not produce success alerts. Completion notifications are published only for root sessions. When `hideChatContent` is enabled, question and permission alerts are sent without a session title lookup. If title content is enabled but the title is unavailable, request alerts fall back to `OpenCode`.
+Completion alerts are driven primarily by the native `session.execution.succeeded` event. Idle events, including `session.idle` and status-idle fallbacks, are also observed and coalesced per activity cycle, so duplicate success or idle signals publish at most one completion notification until new activity begins another cycle. Execution failed or interrupted events do not produce success alerts. Retry handling observes OpenCode's retry decision without changing its policy. Completion notifications are published only for root sessions. When `hideChatContent` is enabled, question and permission alerts are sent without a session title lookup. If title content is enabled but the title is unavailable, request alerts fall back to `OpenCode`.
 
 Publishes and dismissals use the configured request timeout and bounded retries for network failures, timeouts, and HTTP 408, 425, 429, 500, 502, 503, and 504. Other HTTP errors, including 400, 401, 403, and 404, fail without retry. A `Retry-After` header is honored when the requested delay is 30 seconds or less. A longer delay is logged as a failure rather than retried earlier than the server allows.
 
@@ -140,18 +153,50 @@ or retryable HTTP status, using `retryDelayMs` between attempts and
 retry. If the plugin cannot establish that a session is a root session, it skips
 the completion alert.
 
-The event subscription reconnects automatically after a failure or end of the stream with exponential backoff and jitter, capped at 10 seconds. The backoff resets after a connection remains open for 10 seconds, rather than on its first event. The public OpenCode event stream is live-only, so events emitted while disconnected cannot be replayed. Reconnection resumes live processing; it does not recover or resynchronize missed events.
+Session-list, permission, and storage-scan requests use bounded deadlines so a
+stalled dependency cannot hold reconciliation open indefinitely. Permission
+evaluation schedules advisory checks only for `ask` decisions and coalesces
+bursts per session. Allowed tool actions do not schedule advisory checks, and
+the plugin does not change OpenCode's permission or retry policy.
 
-The plugin targets the pinned OpenCode 2.0.4 API and filters subscribed events
-locally. Comparable durable event sequence numbers take precedence over local
-prompt timestamps, so clock skew does not discard a newer execution event.
+The event subscription reconnects automatically after a failure or end of the
+stream with exponential backoff and jitter, capped at 10 seconds. The backoff
+resets after a connection remains open for 10 seconds, rather than on its first
+event. The public OpenCode event stream is live-only, so events emitted while
+disconnected cannot be replayed. Startup and reconnect reconciliation use
+session snapshots and pending permission requests to repair notification state.
+Sessions observed executing have durable activity checkpoints, allowing a later
+snapshot to recover a missed successful completion. Startup does not send
+completion alerts for every historical idle session. Prompt admission alone
+does not create a recoverable execution checkpoint.
 
-When the plugin has a location, it checks event locations and falls back to
-cached session locations when an event omits its location. Session metadata
-lookups also check the location before publishing. Moving a session out of the
-plugin's location cancels pending alerts and dismisses existing ones; moving it
-back permits notifications again. Hidden-content request alerts do not perform
-an extra lookup solely to discover an unknown location.
+Notification sequence IDs are saved through `ctx.storage` before publishing.
+Successful dismissal removes the stored record; failed dismissal retains it for
+a later retry. Storage is scoped by server, topic, and plugin location so one
+configuration does not clear another configuration's records. Stored records
+exclude authentication credentials and chat-derived titles. If a notification
+record cannot be saved, the plugin skips publication rather than creating an
+alert it cannot track across a restart.
+
+Snapshot recovery is not exact event replay. The public plugin context exposes
+neither session event logs nor form lookup. Question events missed during a
+disconnect cannot be reconstructed, and stored question notifications from a
+previous process are cleared rather than assumed to remain pending.
+
+The plugin targets the pinned OpenCode 2.2.1 API and requests only relevant
+event types from its event subscription. Durable session events are ordered by
+their aggregate ID and sequence number. Server event timestamps are not
+compared with the local prompt clock.
+
+When both the plugin and an event identify their workspace, workspace IDs take
+precedence over directory spelling. Otherwise the plugin checks directories
+and available project IDs, falling back to cached session locations when an
+event omits its location. Sharing a project does not make separate worktrees
+the same notification scope. Session metadata lookups also check the location
+before publishing. Moving a session out of the plugin's location cancels pending
+alerts and dismisses existing ones; moving it back permits notifications again.
+Hidden-content request alerts do not perform an extra lookup solely to discover
+an unknown location.
 
 The prompt hook performs remote dismissal in the background so a slow ntfy server does not block OpenCode. Archiving or deleting a session, answering or rejecting a question, and answering a permission request cancel stale notifications. Clean shutdown attempts a bounded, best-effort clearing of notifications created by the process; an abruptly killed process cannot clear them.
 
@@ -163,4 +208,10 @@ The ntfy server URL must be reachable by both the machine running OpenCode and t
 
 Run `npm test` to execute every root `*.test.mjs` file, including transport and runtime coverage. Run `npm run typecheck` to typecheck `index.ts` and its imported modules.
 
-Regression coverage includes request timeouts and abort release, bounded retry and non-retry statuses, `Retry-After` limits, stalled response bodies, duplicate idle coalescing, stale completion invalidation, question and permission dismissal, auto-approval suppression, shutdown races, clock skew, reconnect backoff, URL and authentication validation, metadata lookup retries, and workspace filtering.
+Regression coverage includes request timeouts and abort release, bounded retry
+and non-retry statuses, `Retry-After` limits, stalled response bodies, duplicate
+idle coalescing, stale completion invalidation, question and permission dismissal,
+auto-approval suppression, shutdown races, clock skew, reconnect backoff, URL and
+authentication validation, metadata lookup retries, workspace identity,
+out-of-order lifecycle events, durable notification recovery, storage scope
+isolation, reconnect snapshots, filtered subscriptions, and hook cleanup.

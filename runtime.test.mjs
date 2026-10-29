@@ -151,8 +151,9 @@ const waitForAbort = (signal) =>
 
 const makeSetupContext = ({ options = {}, get, subscribe }) => {
   const subscriptions = []
+  const registeredHooks = []
+  const hookDisposals = new Map()
   let promptCallback
-  let hookDisposals = 0
   const ctx = {
     options: { ...baseOptions, ...options },
     session: {
@@ -160,11 +161,12 @@ const makeSetupContext = ({ options = {}, get, subscribe }) => {
         if (get) return get(input, requestOptions)
         return { title: "Test session", sessionID: input.sessionID }
       },
-      hook: async (_name, callback) => {
-        promptCallback = callback
+      hook: async (name, callback) => {
+        registeredHooks.push(name)
+        if (name === "prompt") promptCallback = callback
         return {
           dispose: async () => {
-            hookDisposals++
+            hookDisposals.set(name, (hookDisposals.get(name) ?? 0) + 1)
           },
         }
       },
@@ -179,8 +181,12 @@ const makeSetupContext = ({ options = {}, get, subscribe }) => {
   return {
     ctx,
     subscriptions,
+    hooks: () => [...registeredHooks],
     prompt: () => promptCallback,
-    hookDisposals: () => hookDisposals,
+    hookDisposals: (name) =>
+      name === undefined
+        ? [...hookDisposals.values()].reduce((total, count) => total + count, 0)
+        : hookDisposals.get(name) ?? 0,
   }
 }
 
@@ -238,6 +244,35 @@ const versionedExecutionEvent = (type, id, created, seq) => ({
   durable: { aggregateID: id, seq, version: 1 },
   data: { sessionID: id },
 })
+
+const statusRetryEvent = (id = sessionID) => ({
+  type: "session.status",
+  data: { sessionID: id, status: { type: "retry" } },
+})
+
+const nativeSessionEvent = (type, id, seq, data = {}, location) => ({
+  id: `${type}-${id}-${seq}`,
+  created: 1_000_000 + seq,
+  type,
+  durable: { aggregateID: id, seq, version: 1 },
+  ...(location ? { location } : {}),
+  data: { sessionID: id, ...data },
+})
+
+const nativeCreatedEvent = (id, seq, directory, workspaceID, title, projectID) =>
+  nativeSessionEvent(
+    "session.created",
+    id,
+    seq,
+    {
+      projectID,
+      location: { directory, ...(workspaceID ? { workspaceID } : {}) },
+      slug: id,
+      title,
+      version: "2.2.1",
+    },
+    { directory, ...(workspaceID ? { workspaceID } : {}) },
+  )
 
 const sessionArchivedEvent = (id = sessionID) => ({
   type: "session.archived",
@@ -1829,16 +1864,26 @@ test(
   "plugin cleanup disposes the prompt hook exactly once",
   { timeout: 1500 },
   async () => {
-    const { ctx, hookDisposals } = makeSetupContext({
+    const { ctx, hookDisposals, hooks } = makeSetupContext({
       subscribe: (_call, requestOptions) =>
         (async function* () {
           await waitForAbort(requestOptions.signal)
         })(),
     })
     const cleanup = await setupNtfyRuntime(ctx)
+    const hookNames = hooks()
+    assert.ok(hookNames.includes("prompt"))
     await withDeadline(cleanup(), 750, "first plugin cleanup")
     await withDeadline(cleanup(), 750, "second plugin cleanup")
-    assert.equal(hookDisposals(), 1)
+    assert.equal(hookDisposals("prompt"), 1)
+    for (const name of new Set(hookNames)) {
+      const registrations = hookNames.filter((candidate) => candidate === name).length
+      assert.equal(
+        hookDisposals(name),
+        registrations,
+        `${name} hook registrations must each be disposed exactly once`,
+      )
+    }
   },
 )
 
@@ -2051,7 +2096,7 @@ test(
 )
 
 test(
-  "plugin subscription uses only supported RequestOptions and ignores unrelated events",
+  "plugin subscription requests only relevant native event types and ignores unrelated events",
   { timeout: 1500 },
   async () => {
     const mock = createMock()
@@ -2069,7 +2114,24 @@ test(
       assert.ok(subscriptions.length >= 1)
       const requestOptions = subscriptions[0]
       assert.ok(requestOptions.signal instanceof AbortSignal)
-      assert.equal("types" in requestOptions, false)
+      assert.ok(Array.isArray(requestOptions.types))
+      for (const type of [
+        "session.execution.succeeded",
+        "permission.asked",
+        "form.created",
+      ]) {
+        assert.ok(
+          requestOptions.types.includes(type),
+          `filtered subscription must include ${type}`,
+        )
+      }
+      for (const type of ["project.updated", "server.connected", "session.text.delta"]) {
+        assert.equal(
+          requestOptions.types.includes(type),
+          false,
+          `filtered subscription must exclude ${type}`,
+        )
+      }
 
       await flushTasks()
       assert.equal(mock.posts.length, 0)
@@ -2925,6 +2987,498 @@ test(
         postsFor(mock, "opencode-permission-hidden-location-permission")[0].body.title,
         "OpenCode",
       )
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+for (const [terminalName, terminalType] of [
+  ["failure", "session.execution.failed"],
+  ["interruption", "session.execution.interrupted"],
+]) {
+  for (const [fallbackName, fallbackEvent] of [
+    ["session.idle", idleEvent],
+    ["session.status idle", statusIdleEvent],
+  ]) {
+    test(
+      `clock-skewed ${terminalName} after a local prompt blocks ${fallbackName} completions`,
+      { timeout: 2000 },
+      async () => {
+        const mock = createMock()
+        const restoreFetch = useFetch(mock.fetch)
+        const { runtime } = await makeRuntime()
+        try {
+          await runtime.handlePrompt(sessionID)
+          await runtime.handleEvent(
+            versionedExecutionEvent("session.execution.started", sessionID, 1000, 10),
+          )
+          await runtime.handleEvent(
+            versionedExecutionEvent(terminalType, sessionID, 1001, 11),
+          )
+          await runtime.handleEvent(fallbackEvent())
+
+          assert.equal(completionPosts(mock).length, 0)
+          assert.equal(mock.posts.length, 0)
+        } finally {
+          await disposeQuietly(runtime)
+          restoreFetch()
+        }
+      },
+    )
+  }
+}
+
+test(
+  "duplicate and out-of-order renames do not replace a newer session title",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime({
+      get: async () => {
+        throw new Error("cached session metadata must be used")
+      },
+      options: { hideChatContent: false },
+    })
+    const id = "lifecycle-title-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(id, 1, "/tmp/opencode-ntfy-runtime", "workspace-id", "Initial title", "project-id"),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.renamed", id, 10, { title: "Latest title" }))
+      await runtime.handleEvent(nativeSessionEvent("session.renamed", id, 10, { title: "Duplicate title" }))
+      await runtime.handleEvent(nativeSessionEvent("session.renamed", id, 9, { title: "Stale title" }))
+
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 20))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 21))
+
+      const completions = postsFor(mock, `opencode-${id}`)
+      assert.equal(completions.length, 1)
+      assert.equal(completions[0].body.title, "Latest title")
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "out-of-order lifecycle moves cannot re-enter the workspace scope",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const currentDirectory = "/tmp/opencode-ntfy-runtime"
+    const otherDirectory = "/tmp/other-workspace"
+    const { runtime } = await makeRuntime({
+      location: { directory: currentDirectory, workspaceID: "workspace-current" },
+    })
+    const id = "lifecycle-move-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(id, 1, currentDirectory, "workspace-current", "Move title", "project-id"),
+      )
+      await runtime.handleEvent(
+        nativeSessionEvent(
+          "session.moved",
+          id,
+          10,
+          {
+            location: { directory: otherDirectory, workspaceID: "workspace-other" },
+            projectID: "project-id",
+          },
+          { directory: otherDirectory, workspaceID: "workspace-other" },
+        ),
+      )
+      await runtime.handleEvent(idleEvent(id))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 0)
+
+      await runtime.handleEvent(
+        nativeSessionEvent(
+          "session.moved",
+          id,
+          9,
+          {
+            location: { directory: currentDirectory, workspaceID: "workspace-current" },
+            projectID: "project-id",
+          },
+          { directory: currentDirectory, workspaceID: "workspace-current" },
+        ),
+      )
+      await runtime.handleEvent(idleEvent(id))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 0)
+
+      await runtime.handleEvent(
+        nativeSessionEvent(
+          "session.moved",
+          id,
+          11,
+          {
+            location: { directory: currentDirectory, workspaceID: "workspace-current" },
+            projectID: "project-id",
+          },
+          { directory: currentDirectory, workspaceID: "workspace-current" },
+        ),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 12))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 13))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "out-of-order archive and unarchive events do not change archival state",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    const id = "lifecycle-archive-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(id, 1, "/tmp/opencode-ntfy-runtime", "workspace-id", "Archive title", "project-id"),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 2))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 3))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(nativeSessionEvent("session.archived", id, 10))
+      await runtime.handleEvent(nativeSessionEvent("session.archived", id, 10))
+      await runtime.handleEvent(nativeSessionEvent("session.unarchived", id, 9))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 11))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 12))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(nativeSessionEvent("session.unarchived", id, 13))
+      await runtime.handleEvent(nativeSessionEvent("session.archived", id, 10))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 14))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 15))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 2)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "workspace identity outranks directory spelling for event scope",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const directory = "/tmp/opencode-ntfy-runtime"
+    const { runtime } = await makeRuntime({
+      location: {
+        directory,
+        workspaceID: "workspace-main",
+        project: {
+          id: "project-id",
+          directory,
+          canonical: directory,
+        },
+      },
+    })
+    try {
+      await runtime.handleEvent(
+        idleEvent("same-workspace-session", {
+          directory: "/tmp/same-workspace-worktree",
+          workspaceID: "workspace-main",
+        }),
+      )
+      assert.equal(postsFor(mock, "opencode-same-workspace-session").length, 1)
+
+      await runtime.handleEvent(
+        idleEvent("other-workspace-session", {
+          directory,
+          workspaceID: "workspace-other",
+        }),
+      )
+      assert.equal(postsFor(mock, "opencode-other-workspace-session").length, 0)
+      assert.equal(mock.posts.length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "shared project identity does not make separate worktrees the same scope",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const directory = "/tmp/opencode-ntfy-runtime"
+    const { runtime } = await makeRuntime({
+      location: {
+        directory,
+        workspaceID: "workspace-main",
+        project: {
+          id: "project-id",
+          directory,
+          canonical: directory,
+        },
+      },
+    })
+    const id = "project-worktree-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(id, 1, "/tmp/other-worktree", undefined, "Worktree title", "project-id"),
+      )
+      await runtime.handleEvent(idleEvent(id, { directory: "/tmp/other-worktree" }))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 0)
+      assert.equal(mock.posts.length, 0)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "public session metadata without a workspace preserves the known workspace identity",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const directory = "/tmp/opencode-ntfy-runtime"
+    const { runtime } = await makeRuntime({
+      location: {
+        directory,
+        workspaceID: "workspace-main",
+        project: {
+          id: "project-id",
+          directory,
+          canonical: directory,
+        },
+      },
+      get: async () => ({
+        title: "Public title",
+        projectID: "project-id",
+        location: { directory: "/tmp/same-workspace-worktree" },
+      }),
+      options: { hideChatContent: false },
+    })
+    const id = "public-metadata-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(
+          id,
+          1,
+          "/tmp/same-workspace-worktree",
+          "workspace-main",
+          undefined,
+          "project-id",
+        ),
+      )
+      await runtime.handleEvent(idleEvent(id))
+
+      const completions = postsFor(mock, `opencode-${id}`)
+      assert.equal(completions.length, 1)
+      assert.equal(completions[0].body.title, "Public title")
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "status retry after a failure clears blocked completion state",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    try {
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.failed", sessionID, 1000, 10),
+      )
+      await runtime.handleEvent(idleEvent())
+      assert.equal(completionPosts(mock).length, 0)
+
+      await runtime.handleEvent(statusRetryEvent())
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.succeeded", sessionID, 1001, 11),
+      )
+      assert.equal(completionPosts(mock).length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "an out-of-scope permission title lookup does not block a later in-scope request",
+  { timeout: 1500 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const directory = "/tmp/opencode-ntfy-runtime"
+    let lookups = 0
+    const { runtime } = await makeRuntime({
+      location: { directory },
+      get: async () => {
+        lookups++
+        if (lookups === 1) {
+          return {
+            title: "Outside session",
+            location: { directory: "/tmp/other-workspace" },
+          }
+        }
+        return { title: "Inside session", location: { directory } }
+      },
+      options: { hideChatContent: false, permissionDelayMs: 0 },
+    })
+    const id = "out-of-scope-session"
+    const requestID = "out-of-scope-permission"
+    try {
+      await runtime.handleEvent(permissionEvent(requestID, id))
+      assert.equal(postsFor(mock, `opencode-permission-${requestID}`).length, 0)
+
+      await runtime.handleEvent(sessionMovedEvent(id, directory))
+      await runtime.handleEvent(permissionEvent(requestID, id))
+      assert.equal(postsFor(mock, `opencode-permission-${requestID}`).length, 1)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "stale session.created events cannot resurrect a deleted session",
+  { timeout: 3000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    const directory = "/tmp/opencode-ntfy-runtime"
+    const runScenario = async (id, staleCreatedSeq) => {
+      await runtime.handleEvent(
+        nativeCreatedEvent(id, 1, directory, "workspace-id", "Initial title", "project-id"),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 2))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 3))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(nativeSessionEvent("session.deleted", id, 10))
+      await runtime.handleEvent(
+        nativeCreatedEvent(
+          id,
+          staleCreatedSeq,
+          directory,
+          "workspace-id",
+          "Stale title",
+          "project-id",
+        ),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 8))
+      await runtime.handleEvent(idleEvent(id))
+      assert.equal(
+        postsFor(mock, `opencode-${id}`).length,
+        1,
+        `stale created seq ${staleCreatedSeq} must not revive deleted session ${id}`,
+      )
+
+      await runtime.handleEvent(
+        nativeCreatedEvent(
+          id,
+          11,
+          directory,
+          "workspace-id",
+          "Restored title",
+          "project-id",
+        ),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 12))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 13))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 2)
+    }
+    try {
+      await runScenario("deleted-stale-created-one", 1)
+      await runScenario("deleted-stale-created-nine", 9)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "repeated execution success events in one activity cycle publish once",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    const id = "repeated-success-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(
+          id,
+          1,
+          "/tmp/opencode-ntfy-runtime",
+          "workspace-id",
+          "Repeated success title",
+          "project-id",
+        ),
+      )
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 2))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 10))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 11))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(idleEvent(id))
+      await runtime.handleEvent(statusIdleEvent(id))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(nativeSessionEvent("session.execution.started", id, 12))
+      await runtime.handleEvent(nativeSessionEvent("session.execution.succeeded", id, 13))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 2)
+    } finally {
+      await disposeQuietly(runtime)
+      restoreFetch()
+    }
+  },
+)
+
+test(
+  "authoritative success does not republish an idle fallback in the same cycle",
+  { timeout: 2000 },
+  async () => {
+    const mock = createMock()
+    const restoreFetch = useFetch(mock.fetch)
+    const { runtime } = await makeRuntime()
+    const id = "idle-then-success-session"
+    try {
+      await runtime.handleEvent(
+        nativeCreatedEvent(
+          id,
+          1,
+          "/tmp/opencode-ntfy-runtime",
+          "workspace-id",
+          "Idle fallback title",
+          "project-id",
+        ),
+      )
+      await runtime.handleEvent(idleEvent(id))
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
+
+      await runtime.handleEvent(
+        versionedExecutionEvent("session.execution.succeeded", id, 1_000_010, 10),
+      )
+      assert.equal(postsFor(mock, `opencode-${id}`).length, 1)
     } finally {
       await disposeQuietly(runtime)
       restoreFetch()
